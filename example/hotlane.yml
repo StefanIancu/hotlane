@@ -1,0 +1,9 @@
+app: api
+build: npm run build
+run: node dist/server.js
+port: 3000
+verify:
+  - http: /health == 200
+  - run: ./smoke.sh
+ring: 5
+# archive: ghcr.io/acme/api   # async OCI build target (post-MVP)
