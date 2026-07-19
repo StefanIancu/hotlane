@@ -219,6 +219,8 @@ src: ../srv-$app
 domain: $app.local
 verify:
   - http: /health == 200
+replay:
+  last: 10
 EOF
 done
 "$BIN" serve -apps "$MAPPS" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
@@ -239,6 +241,9 @@ cd "$TMP/srv-alpha"
 perl -pi -e 's/hello from alpha/ALPHA v2/' message.txt
 OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push -app alpha)" || fail "alpha push rejected: $OUT"
 echo "$OUT" | grep -q "PROMOTED v2" || fail "no PROMOTED v2 in: $OUT"
+# replay is per-app: alpha's buffer (filled by the routing checks above)
+# flags the intended content change; report mode still promotes.
+echo "$OUT" | grep -q "MISMATCH GET /" || fail "alpha replay verdict missing in: $OUT"
 [ "$(host_body alpha.local)" = "ALPHA v2 from demo-app v1" ] || fail "alpha not updated"
 [ "$(host_body beta.local)" = "hello from beta from demo-app v1" ] || fail "beta changed by alpha's push"
 

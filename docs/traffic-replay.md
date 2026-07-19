@@ -1,6 +1,9 @@
 # Design sketch: traffic-replay verification
 
-Status: sketch, pre-implementation. Open questions at the bottom.
+Status: shipped in v0.6.0 as sketched (phase 2 - replaying the slice in
+drift checks - still open). Measured capture overhead on the live path:
+~1&micro;s/request (480ns bare vs 1.45&micro;s captured, BenchmarkCapture) -
+noise against millisecond-scale request handling.
 
 ## Problem
 

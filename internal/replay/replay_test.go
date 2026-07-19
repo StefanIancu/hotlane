@@ -2,6 +2,7 @@ package replay
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,6 +149,115 @@ func TestRunToleratesTimestamps(t *testing.T) {
 	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
 	if res.Mismatched != 0 || res.Matched != 1 {
 		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestCaptureAndReplayBodiedRequest(t *testing.T) {
+	// The POST opt-in: the request body must be tee'd at capture and
+	// faithfully re-sent at replay.
+	b := NewBuffer(8)
+	echo := func(w http.ResponseWriter, r *http.Request) {
+		in, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "got:%s", in)
+	}
+	srv := captureServer(b, map[string]bool{"POST": true}, nil, echo)
+	resp, err := http.Post(srv.URL+"/submit", "text/plain", strings.NewReader("payload-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	srv.Close()
+	if string(live) != "got:payload-1" {
+		t.Fatalf("live response corrupted by capture tee: %q", live)
+	}
+	e := b.Snapshot(1)[0]
+	if string(e.Body) != "payload-1" || string(e.RespBody) != "got:payload-1" {
+		t.Fatalf("entry = body %q resp %q", e.Body, e.RespBody)
+	}
+
+	// Identical fork: body-dependent response must match.
+	fork := httptest.NewServer(http.HandlerFunc(echo))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Matched != 1 || res.Mismatched != 0 {
+		t.Errorf("res = %+v", res)
+	}
+
+	// A fork that mishandles the body must mismatch.
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "got:")
+	}))
+	defer broken.Close()
+	res = Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(broken.URL, "http://"), time.Second)
+	if res.Mismatched != 1 {
+		t.Errorf("body-dropping fork not flagged: %+v", res)
+	}
+}
+
+func TestCaptureSkipsOversizedResponse(t *testing.T) {
+	b := NewBuffer(8)
+	big := strings.Repeat("x", bodyCap+100)
+	srv := captureServer(b, map[string]bool{"GET": true}, nil, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, big)
+	})
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(body) != len(big) {
+		t.Fatalf("client got %d bytes, want %d - capture must never truncate real responses", len(body), len(big))
+	}
+	if b.Len() != 0 {
+		t.Errorf("oversized exchange was buffered")
+	}
+}
+
+func TestCaptureSkipsOversizedRequestBody(t *testing.T) {
+	b := NewBuffer(8)
+	var received int
+	srv := captureServer(b, map[string]bool{"POST": true}, nil, func(w http.ResponseWriter, r *http.Request) {
+		in, _ := io.ReadAll(r.Body)
+		received = len(in)
+		fmt.Fprint(w, "ok")
+	})
+	defer srv.Close()
+	big := strings.Repeat("y", bodyCap+100)
+	resp, err := http.Post(srv.URL+"/upload", "text/plain", strings.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if received != len(big) {
+		t.Fatalf("app received %d bytes, want %d - capture must never eat request bytes", received, len(big))
+	}
+	if b.Len() != 0 {
+		t.Errorf("oversized request was buffered")
+	}
+}
+
+// BenchmarkCapture measures what the recorder adds to every live
+// request when replay is enabled - the hot-path tax of the feature.
+func BenchmarkCapture(b *testing.B) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello from demo-app")
+	})
+	for _, on := range []bool{false, true} {
+		name := "bare"
+		h := http.Handler(handler)
+		if on {
+			name = "captured"
+			h = Capture(handler, NewBuffer(512), map[string]bool{"GET": true}, nil)
+		}
+		b.Run(name, func(b *testing.B) {
+			req := httptest.NewRequest("GET", "/", nil)
+			for i := 0; i < b.N; i++ {
+				h.ServeHTTP(httptest.NewRecorder(), req)
+			}
+		})
 	}
 }
 
