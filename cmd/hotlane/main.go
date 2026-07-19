@@ -25,6 +25,7 @@ import (
 
 	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
+	"github.com/StefanIancu/hotlane/internal/notify"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/proxy"
 	"github.com/StefanIancu/hotlane/internal/verify"
@@ -107,7 +108,8 @@ func cmdServe(args []string) {
 	front := proxy.New()
 	front.Set(p.Backend)
 
-	arch := archive.New(cfg, p.DataDir)
+	notif := &notify.Notifier{URL: cfg.Notify, App: cfg.App}
+	arch := archive.New(cfg, p.DataDir, notif)
 	// Archive the starting state so a clean image exists from day one; on
 	// adopt this is the working tree, which matches the baseline contract
 	// (serve starts from a clean checkout).
@@ -196,6 +198,13 @@ func cmdServe(args []string) {
 		w.Header().Set("Content-Type", "application/json")
 		if !out.Promoted {
 			out.Logs = p.Discard(res)
+			for _, v := range out.Verify {
+				if !v.OK {
+					notif.Send(notify.EventPushRejected,
+						fmt.Sprintf("v%d: %s - %s", res.Version, v.Hook, v.Detail))
+					break
+				}
+			}
 			w.WriteHeader(http.StatusUnprocessableEntity)
 			json.NewEncoder(w).Encode(out)
 			return

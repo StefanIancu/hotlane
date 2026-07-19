@@ -1,4 +1,5 @@
 app: api
+image: node:22-alpine
 build: npm run build
 run: node dist/server.js
 port: 3000
@@ -6,4 +7,5 @@ verify:
   - http: /health == 200
   - run: ./smoke.sh
 ring: 5
-# archive: ghcr.io/acme/api   # async OCI build target (post-MVP)
+# archive: ghcr.io/acme/api   # registry ref for the archivist's clean images
+# notify: https://hooks.slack.com/services/...   # webhook for drift/rejection events

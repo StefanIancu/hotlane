@@ -31,6 +31,7 @@ type Config struct {
 	Verify  []VerifyHook `yaml:"verify"`
 	Ring    int          `yaml:"ring"`
 	Archive string       `yaml:"archive"`
+	Notify  string       `yaml:"notify"` // webhook URL for drift/rejection events (Slack/Discord compatible)
 }
 
 // Load reads and validates a hotlane.yml.

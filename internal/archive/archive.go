@@ -21,6 +21,7 @@ import (
 
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/docker"
+	"github.com/StefanIancu/hotlane/internal/notify"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
 
@@ -43,18 +44,20 @@ type Status struct {
 
 // Archivist owns the clean image and the drift verdict for one app.
 type Archivist struct {
-	Cfg     *config.Config
-	DataDir string
+	Cfg      *config.Config
+	DataDir  string
+	Notifier *notify.Notifier
 
 	mu     sync.Mutex
 	status Status
 }
 
-func New(cfg *config.Config, dataDir string) *Archivist {
+func New(cfg *config.Config, dataDir string, n *notify.Notifier) *Archivist {
 	return &Archivist{
-		Cfg:     cfg,
-		DataDir: dataDir,
-		status:  Status{Image: "hotlane-" + cfg.App + ":clean", Drift: DriftUnknown},
+		Cfg:      cfg,
+		DataDir:  dataDir,
+		Notifier: n,
+		status:   Status{Image: "hotlane-" + cfg.App + ":clean", Drift: DriftUnknown},
 	}
 }
 
@@ -108,6 +111,7 @@ func (a *Archivist) Archive(version int, liveBackend string) {
 		a.status.Detail = "clean build failed: " + err.Error()
 		a.mu.Unlock()
 		log.Printf("archive: %v", err)
+		a.Notifier.Send(notify.EventCleanBuildFailed, err.Error())
 		return
 	}
 	a.status.LastVersion = version
@@ -193,6 +197,7 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 	}
 	docker.Remove(name)
 
+	prev := a.status.Drift
 	a.status.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	if detail == "" {
 		a.status.Drift = DriftClean
@@ -202,6 +207,16 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 		a.status.Drift = DriftDrifted
 		a.status.Detail = detail
 		log.Printf("archive: drift check DRIFTED: %s", detail)
+	}
+
+	// Notify on transitions only: a 6-hourly check in a persistent state
+	// should ping once when it breaks and once when it heals, not every
+	// run - alert fatigue is how notifications get ignored.
+	switch {
+	case a.status.Drift == DriftDrifted && prev != DriftDrifted:
+		a.Notifier.Send(notify.EventDriftDetected, detail+"\nnext push will rebuild from "+a.CleanImage())
+	case a.status.Drift == DriftClean && prev == DriftDrifted:
+		a.Notifier.Send(notify.EventDriftHealed, "")
 	}
 	return a.status
 }

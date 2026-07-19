@@ -44,13 +44,16 @@ push (delta)                          ~0.1s
 ```yaml
 # hotlane.yml
 app: api
+image: node:22-alpine         # base image for the warm baseline
 build: npm run build          # incremental command, runs inside the fork
 run: node dist/server.js
+port: 3000
 verify:
   - http: /health == 200
   - run: ./smoke.sh
 ring: 5                       # versions kept for instant rollback
-archive: ghcr.io/acme/api     # async OCI build target (post-MVP)
+archive: ghcr.io/acme/api     # registry ref for the archivist's clean images
+notify: https://hooks.slack.com/services/...  # webhook: drift detected/healed, push rejected
 ```
 
 ## What hotlane is not
