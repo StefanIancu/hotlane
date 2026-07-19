@@ -43,7 +43,7 @@ Two requirements on the CI side:
 hotlane serve -tls-domain deploy.example.com -token $(openssl rand -hex 24)
 ```
 
-Certificates come from Let's Encrypt automatically (TLS-ALPN, so only the API port itself - :443 by default - needs to be open; renewals are handled for you). CI then needs exactly two secrets and zero infrastructure:
+Certificates come from Let's Encrypt automatically (TLS-ALPN on :443; renewals handled for you), and the listener is shared the way humans expect: **your app is served at `https://deploy.example.com/` with TLS included**, while the daemon API tucks under the reserved `/-/` prefix (`https://deploy.example.com/-/v1/...`). Port 80 redirects to https. CI then needs exactly two secrets and zero infrastructure:
 
 ```bash
 HOTLANE_DAEMON=https://deploy.example.com HOTLANE_TOKEN=... hotlane push
@@ -170,13 +170,13 @@ phases:
 The API is one endpoint - any environment that has git and curl can deploy:
 
 ```bash
-BASE=$(curl -s -H "Authorization: Bearer $HOTLANE_TOKEN" $HOTLANE_DAEMON/v1/status | jq -r .baseline_commit)
+BASE=$(curl -s -H "Authorization: Bearer $HOTLANE_TOKEN" $HOTLANE_DAEMON/-/v1/status | jq -r .baseline_commit)
 git diff "$BASE" --relative \
   | curl -f -X POST -H "Authorization: Bearer $HOTLANE_TOKEN" \
-      --data-binary @- "$HOTLANE_DAEMON/v1/push"
+      --data-binary @- "$HOTLANE_DAEMON/-/v1/push"
 ```
 
-The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /v1/rollback` (`{"version": N}` or empty for previous) and `POST /v1/drift-check` complete the surface.
+The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /-/v1/rollback` (`{"version": N}` or empty for previous) and `POST /-/v1/drift-check` complete the surface. (On the private API port, bare `/v1/...` paths work as aliases.)
 
 ## Where does hotlane run (and not run)?
 

@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,10 +189,19 @@ func cmdServe(args []string) {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	// handle registers every API route twice: bare (the private API port)
+	// and under /-/ (the shared TLS listener, where the app owns every
+	// other path). /-/ is the GitLab-style instance-route prefix - obscure
+	// enough that user apps won't collide with it.
+	handle := func(pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, h)
+		method, path, _ := strings.Cut(pattern, " ")
+		mux.HandleFunc(method+" /-"+path, h)
+	}
+	handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
 	})
-	mux.HandleFunc("GET /v1/logs", func(w http.ResponseWriter, r *http.Request) {
+	handle("GET /v1/logs", func(w http.ResponseWriter, r *http.Request) {
 		tail := 100
 		if t := r.URL.Query().Get("tail"); t != "" {
 			if n, err := strconv.Atoi(t); err == nil && n > 0 && n <= 10000 {
@@ -201,7 +211,7 @@ func cmdServe(args []string) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, docker.Logs(p.Live, tail))
 	})
-	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
+	handle("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"app":             cfg.App,
@@ -214,12 +224,12 @@ func cmdServe(args []string) {
 			"archive":         arch.Status(),
 		})
 	})
-	mux.HandleFunc("POST /v1/drift-check", func(w http.ResponseWriter, r *http.Request) {
+	handle("POST /v1/drift-check", func(w http.ResponseWriter, r *http.Request) {
 		st := arch.DriftCheck(p.Backend)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(st)
 	})
-	mux.HandleFunc("POST /v1/rollback", func(w http.ResponseWriter, r *http.Request) {
+	handle("POST /v1/rollback", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Version int `json:"version"`
 		}
@@ -253,7 +263,7 @@ func cmdServe(args []string) {
 	// Pushes are serialized: forks share the shadow tree and the version
 	// counter, and one verified promote at a time is the contract.
 	var pushMu sync.Mutex
-	mux.HandleFunc("POST /v1/push", func(w http.ResponseWriter, r *http.Request) {
+	handle("POST /v1/push", func(w http.ResponseWriter, r *http.Request) {
 		diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -312,7 +322,8 @@ func cmdServe(args []string) {
 		want := []byte("Bearer " + *token)
 		api = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got := []byte(r.Header.Get("Authorization"))
-			if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare(got, want) != 1 {
+			healthz := r.URL.Path == "/healthz" || r.URL.Path == "/-/healthz"
+			if !healthz && subtle.ConstantTimeCompare(got, want) != 1 {
 				http.Error(w, "unauthorized (set HOTLANE_TOKEN)", http.StatusUnauthorized)
 				return
 			}
@@ -328,19 +339,37 @@ func cmdServe(args []string) {
 	}()
 
 	if *tlsDomain != "" {
-		// Direct HTTPS: the certificate comes from Let's Encrypt via the
-		// TLS-ALPN challenge, so only the API port itself must be open.
-		if *apiAddr == ":7433" {
-			*apiAddr = ":443"
-		}
+		// Shared HTTPS listener on :443: the APP owns https://domain/ (a
+		// browser typing the domain gets the app, with TLS, zero config),
+		// while the daemon API lives under the /-/ prefix. The private
+		// API listener keeps running unchanged. Certificates come from
+		// Let's Encrypt via the TLS-ALPN challenge.
 		mgr := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(*tlsDomain),
 			Cache:      autocert.DirCache(filepath.Join(home, ".hotlane", "autocert")),
 		}
-		srv := &http.Server{Addr: *apiAddr, Handler: api, TLSConfig: mgr.TLSConfig()}
-		log.Printf("hotlane %s: API on https://%s%s (app=%q ring=%d)", version, *tlsDomain, *apiAddr, cfg.App, cfg.Ring)
-		log.Fatal(srv.ListenAndServeTLS("", ""))
+		shared := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/-" || strings.HasPrefix(r.URL.Path, "/-/") {
+				api.ServeHTTP(w, r)
+				return
+			}
+			front.ServeHTTP(w, r)
+		})
+		srv := &http.Server{Addr: ":443", Handler: shared, TLSConfig: mgr.TLSConfig()}
+		go func() {
+			// Best-effort http->https redirect; a busy :80 is not fatal.
+			redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "https://"+*tlsDomain+r.URL.RequestURI(), http.StatusMovedPermanently)
+			})
+			if err := http.ListenAndServe(":80", redirect); err != nil {
+				log.Printf("hotlane: :80 redirect listener: %v", err)
+			}
+		}()
+		go func() {
+			log.Printf("hotlane %s: app on https://%s/ + API on https://%s/-/ (ring=%d)", version, *tlsDomain, *tlsDomain, cfg.Ring)
+			log.Fatal(srv.ListenAndServeTLS("", ""))
+		}()
 	}
 	log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, cfg.App, cfg.Ring)
 	log.Fatal(http.ListenAndServe(*apiAddr, api))
@@ -353,7 +382,7 @@ func cmdLogs(args []string) {
 	tail := fs.Int("n", 100, "number of log lines")
 	fs.Parse(args)
 
-	resp, err := apiRequest("GET", fmt.Sprintf("%s/v1/logs?tail=%d", *daemon, *tail), "", nil)
+	resp, err := apiRequest("GET", fmt.Sprintf("%s/-/v1/logs?tail=%d", *daemon, *tail), "", nil)
 	if err != nil {
 		log.Fatalf("hotlane logs: %v", err)
 	}
@@ -404,7 +433,7 @@ func cmdPush(args []string) {
 		log.Printf("hotlane push: no changes vs the daemon's baseline; forking current state anyway")
 	}
 
-	resp, err := apiRequest("POST", *daemon+"/v1/push", "text/x-diff", bytes.NewReader(diff))
+	resp, err := apiRequest("POST", *daemon+"/-/v1/push", "text/x-diff", bytes.NewReader(diff))
 	if err != nil {
 		log.Fatalf("hotlane push: %v", err)
 	}
@@ -451,7 +480,7 @@ func cmdStatus(args []string) {
 		LastFork *pool.ForkResult `json:"last_fork"`
 		Archive  archive.Status   `json:"archive"`
 	}
-	getJSON(*daemon+"/v1/status", &st)
+	getJSON(*daemon+"/-/v1/status", &st)
 	fmt.Printf("app:  %s\n", st.App)
 	fmt.Printf("live: v%d (%s) -> %s\n", st.Version, st.Live, st.Backend)
 	fmt.Println("ring:")
@@ -485,7 +514,7 @@ func cmdDrift(args []string) {
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	fs.Parse(args)
 
-	resp, err := apiRequest("POST", *daemon+"/v1/drift-check", "application/json", nil)
+	resp, err := apiRequest("POST", *daemon+"/-/v1/drift-check", "application/json", nil)
 	if err != nil {
 		log.Fatalf("hotlane drift: %v", err)
 	}
@@ -520,7 +549,7 @@ func cmdRollback(args []string) {
 		req.Version = v
 	}
 	body, _ := json.Marshal(req)
-	resp, err := apiRequest("POST", *daemon+"/v1/rollback", "application/json", bytes.NewReader(body))
+	resp, err := apiRequest("POST", *daemon+"/-/v1/rollback", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("hotlane rollback: %v", err)
 	}
@@ -553,7 +582,7 @@ func daemonBaseline(daemon string) string {
 	var st struct {
 		BaselineCommit string `json:"baseline_commit"`
 	}
-	resp, err := apiRequest("GET", daemon+"/v1/status", "", nil)
+	resp, err := apiRequest("GET", daemon+"/-/v1/status", "", nil)
 	if err != nil {
 		log.Fatalf("hotlane push: %v", err)
 	}
