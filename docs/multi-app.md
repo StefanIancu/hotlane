@@ -164,13 +164,13 @@ instant.
 
 Steps 1-2 are mechanical; 3 is the real work; each step lands green.
 
-## Open questions
+## Decided (2026-07-19)
 
-- `-tls-domain` flag migration: keep accepting it in single-app mode as an
-  override of `domain:`? (Leaning yes - back-compat is cheap here.)
-- Does the API index at `/-/v1` leak app names on an unauthenticated
-  daemon? Today /v1 is behind the token when one is set; same rule applies,
-  so no - but worth stating in the security notes.
-- Held-fork cap: 3 per app or 3 per daemon? (Leaning per app - the cap
-  exists to bound container count per workload, and per-daemon caps create
-  cross-app interference.)
+- `-tls-domain` keeps working in single-app mode as an override of
+  `domain:` - back-compat is cheap here.
+- `/-/v1/apps` sits behind the token like every other route (only healthz
+  is open); no app-name enumeration on an unauthenticated daemon.
+- Held-fork cap is **3 per app**, not per daemon. The cap bounds one
+  workload's appetite; a per-daemon cap would let an agent holding forks on
+  app A block anyone from testing app B - cross-app interference the rest
+  of the design deliberately avoids.
