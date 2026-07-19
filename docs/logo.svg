@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="fl" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff7a1a"/>
+      <stop offset="0.55" stop-color="#ffa028"/>
+      <stop offset="1" stop-color="#ffc668"/>
+    </linearGradient>
+  </defs>
+  <rect width="100" height="100" rx="22" fill="#16130f"/>
+  <!-- flame -->
+  <path fill="url(#fl)" d="M50 12 C57 24 71 34 71 55 C71 72 62 85 50 85 C38 85 29 72 29 55 C29 45 34 38 39 30 C39 39 42 44 46 45 C43 36 45 24 50 12 Z"/>
+  <!-- lane cut through the flame, converging toward the tip -->
+  <path fill="#16130f" d="M43.5 85 L56.5 85 L52 40 L48 40 Z"/>
+  <!-- dashed centerline, shrinking with distance -->
+  <g fill="#ffd9a0">
+    <path d="M49.6 45 L50.4 45 L50.45 49 L49.55 49 Z"/>
+    <path d="M49.4 54 L50.6 54 L50.7 59.5 L49.3 59.5 Z"/>
+    <path d="M49.2 65 L50.8 65 L50.9 71.5 L49.1 71.5 Z"/>
+    <path d="M48.9 77 L51.1 77 L51.2 84 L48.8 84 Z"/>
+  </g>
+</svg>
