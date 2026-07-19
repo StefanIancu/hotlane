@@ -1,0 +1,7 @@
+app: demo
+image: node:22-alpine
+run: node server.js
+port: 3000
+verify:
+  - http: /health == 200
+ring: 3

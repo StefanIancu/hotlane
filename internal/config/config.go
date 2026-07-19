@@ -23,6 +23,8 @@ type VerifyHook struct {
 // Config is the parsed hotlane.yml.
 type Config struct {
 	App     string       `yaml:"app"`
+	Image   string       `yaml:"image"`
+	Workdir string       `yaml:"workdir"`
 	Build   string       `yaml:"build"`
 	RunCmd  string       `yaml:"run"`
 	Port    int          `yaml:"port"`
@@ -44,6 +46,9 @@ func Load(path string) (*Config, error) {
 	if c.Ring == 0 {
 		c.Ring = 5
 	}
+	if c.Workdir == "" {
+		c.Workdir = "/app"
+	}
 	return &c, c.validate()
 }
 
@@ -51,6 +56,9 @@ func (c *Config) validate() error {
 	var problems []string
 	if c.App == "" {
 		problems = append(problems, "app: name is required")
+	}
+	if c.Image == "" {
+		problems = append(problems, "image: base image is required")
 	}
 	if c.RunCmd == "" {
 		problems = append(problems, "run: command is required")
