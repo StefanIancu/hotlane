@@ -1,0 +1,8 @@
+app: bench-node
+image: node:22-alpine
+build: npm install --no-audit --no-fund && npm run build
+run: npm start
+port: 3000
+verify:
+  - http: /health == 200
+ring: 3
