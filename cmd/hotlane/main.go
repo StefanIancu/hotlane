@@ -174,14 +174,17 @@ func cmdServe(args []string) {
 
 	notif := &notify.Notifier{URL: cfg.Notify, App: cfg.App}
 	arch := archive.New(cfg, p.DataDir, notif)
-	// Archive the starting state so a clean image exists from day one; on
-	// adopt this is the working tree, which matches the baseline contract
-	// (serve starts from a clean checkout).
-	if err := arch.Snapshot(src); err != nil {
-		log.Printf("hotlane: archive snapshot: %v", err)
-	} else {
-		go arch.Archive(p.Version, p.Backend)
+	// First boot: snapshot the checkout so a clean image exists from day
+	// one. Restarts keep the existing snapshot - it holds the last
+	// promoted source, while the checkout may be stale (pushes deliver
+	// diffs and never touch it); overwriting it regressed the clean
+	// image and false-positived every post-restart drift check.
+	if !arch.HasSnapshot() {
+		if err := arch.Snapshot(src); err != nil {
+			log.Printf("hotlane: archive snapshot: %v", err)
+		}
 	}
+	go arch.Archive(p.Version, p.Backend)
 	go func() {
 		for range time.Tick(6 * time.Hour) {
 			arch.DriftCheck(p.Backend)
@@ -455,6 +458,9 @@ func cmdPush(args []string) {
 
 	var res pushResponse
 	if err := json.Unmarshal(body, &res); err != nil {
+		if resp.StatusCode == http.StatusNotFound {
+			log.Fatalf("hotlane push: daemon: %s: %s\nhint: a 404 from a -tls-domain daemon usually means this CLI is older than the daemon and hit the app instead of the API (the API moved under /-/ in v0.2.0) - upgrade: curl -fsSL https://hotlane.dev/install.sh | sh", resp.Status, bytes.TrimSpace(body))
+		}
 		log.Fatalf("hotlane push: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
 	}
 	fmt.Printf("fork %s (v%d): snapshot %dms | patch %dms | boot %dms | verify %dms\n",

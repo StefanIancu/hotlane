@@ -112,6 +112,10 @@ wait_archive 5 || fail "archive never reached v5/clean after recovery"
 "$BIN" drift | grep -q "CLEAN" || fail "drift not clean after recovery"
 
 step "auth: daemon restart adopts the live container, token gates the API"
+# Unpushed local edit before the restart: the restarted daemon must NOT
+# re-snapshot the (now dirty) worktree - the archivist keeps the last
+# promoted source, or every post-restart drift check false-positives.
+echo "hello-dirty" > message.txt
 pkill -x hotlane; sleep 2
 HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/" 200 30 || fail "adopt after restart failed"

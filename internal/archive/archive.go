@@ -78,6 +78,17 @@ func (a *Archivist) Drifted() bool { return a.Status().Drift == DriftDrifted }
 
 func (a *Archivist) srcDir() string { return filepath.Join(a.DataDir, "clean-src") }
 
+// HasSnapshot reports whether a source snapshot already exists. The
+// snapshot is written at every promote, so across a daemon restart it
+// holds the last PROMOTED source - which is the truth to rebuild from.
+// The working tree the daemon was started from may be stale (pushes
+// deliver source as diffs and never touch the checkout), so restart
+// paths must not overwrite an existing snapshot with it.
+func (a *Archivist) HasSnapshot() bool {
+	_, err := os.Stat(a.srcDir())
+	return err == nil
+}
+
 // Snapshot copies the just-promoted source tree so the async build works
 // from exactly what was pushed, no matter what later pushes do to the
 // shadow. Call synchronously at promote time; it is a small local copy.
@@ -132,7 +143,18 @@ func (a *Archivist) Archive(version int, liveBackend string) {
 					}
 				}
 			}
-			a.DriftCheck(liveBackend)
+			// Only drift-check when no newer promote is queued: under
+			// rapid pushes the live app is already versions ahead of
+			// this build, and comparing them reads as drift, wrongly
+			// sending the next push through a needless clean rebase.
+			a.mu.Lock()
+			stale := a.pendingVersion != 0
+			a.mu.Unlock()
+			if stale {
+				log.Printf("archive: skipping drift check for v%d (newer promote queued)", version)
+			} else {
+				a.DriftCheck(liveBackend)
+			}
 		}
 
 		a.mu.Lock()
