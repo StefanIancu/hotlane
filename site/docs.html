@@ -76,6 +76,7 @@
     <a href="#ci">ci integration</a>
     <a href="#archivist">the archivist</a>
     <a href="#notify">notifications</a>
+    <a href="#where">where does it run?</a>
     <a href="#limits">limits &amp; honesty</a>
   </nav>
   <div class="top"><a href="https://github.com/StefanIancu/hotlane">github ↗</a></div>
@@ -199,6 +200,11 @@ next push will rebuild from hotlane-api:clean</code></pre>
     <tr><td><code>clean_build_failed</code></td><td>The archivist cannot reproduce the app from source.</td></tr>
   </table></div>
   <p>Payloads carry <code>text</code> (Slack), <code>content</code> (Discord), and structured fields (<code>app</code>, <code>event</code>, <code>detail</code>, <code>at</code>) for anything custom.</p>
+
+  <h2 id="where">Where does hotlane run?</h2>
+  <p><strong>On a machine you own that runs Docker</strong>: a VPS, a bare-metal box, an EC2 instance, a homelab node. One daemon per host, next to your app.</p>
+  <p><strong>Not on ECS, Fargate, Cloud Run, or Kubernetes</strong> - and not inside your app's image. hotlane works by commanding the host's Docker daemon: forking live containers, keeping a ring of stopped versions, fronting them with its own proxy. Managed platforms own that layer themselves, and their orchestrator would fight hotlane over the same containers. hotlane is an <em>alternative</em> to that layer, not a passenger on it: on AWS, the hotlane equivalent of an ECS service is one EC2 instance running <code>hotlane serve</code>.</p>
+  <p><strong>Keeping your managed platform for prod?</strong> Split the loops: run hotlane on a cheap box for dev/staging/agent iteration (push-to-verified in about a second), and let the archivist's registry-pushed, from-source images feed your existing prod pipeline - every version it archives is a normal image ECS or Kubernetes can deploy directly.</p>
 
   <h2 id="limits">Limits &amp; honesty</h2>
   <ul>

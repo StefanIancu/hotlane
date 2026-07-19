@@ -178,6 +178,12 @@ git diff "$BASE" --relative \
 
 The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /v1/rollback` (`{"version": N}` or empty for previous) and `POST /v1/drift-check` complete the surface.
 
+## Where does hotlane run (and not run)?
+
+hotlane runs **on a machine you own with Docker**: a VPS, bare metal, an EC2 instance. It does not run on ECS, Fargate, Cloud Run, or Kubernetes, and not inside your app's image - it works by commanding the host's Docker daemon (forking live containers, keeping the version ring, fronting them with its proxy), which is exactly the layer managed platforms own themselves. hotlane is an alternative to that layer, not a passenger on it: the AWS equivalent of an ECS service is one EC2 instance running `hotlane serve`.
+
+Teams keeping a managed platform for prod can split the loops: hotlane on a cheap box for dev/staging/agent iteration, while the archivist's registry-pushed, from-source images feed the existing prod pipeline - every archived version is a normal image ECS or Kubernetes can deploy directly.
+
 ## Where the trust guarantees live
 
 Nothing about CI integration weakens the model: a push from CI goes through the same fork-verify-flip gate as a local one, the ring keeps instant rollback, and the archivist still produces the registry-pushed, from-source image for every promoted version plus behavioral drift checks against it. Your pipeline gets faster; the audit trail stays.
