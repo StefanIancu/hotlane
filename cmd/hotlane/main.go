@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,6 +23,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
@@ -140,7 +143,12 @@ func cmdServe(args []string) {
 	apiAddr := fs.String("addr", ":7433", "daemon API listen address")
 	proxyAddr := fs.String("proxy", ":7480", "app traffic listen address")
 	token := fs.String("token", os.Getenv("HOTLANE_TOKEN"), "bearer token required on the API (empty = open; keep the API loopback-only then)")
+	tlsDomain := fs.String("tls-domain", "", "serve the API over HTTPS with an auto-provisioned Let's Encrypt certificate for this domain (API defaults to :443; requires -token)")
 	fs.Parse(args)
+
+	if *tlsDomain != "" && *token == "" {
+		log.Fatal("hotlane: -tls-domain exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -289,8 +297,10 @@ func cmdServe(args []string) {
 	// proxy is intentionally untouched - it serves the public app.
 	var api http.Handler = mux
 	if *token != "" {
+		want := []byte("Bearer " + *token)
 		api = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/healthz" && r.Header.Get("Authorization") != "Bearer "+*token {
+			got := []byte(r.Header.Get("Authorization"))
+			if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare(got, want) != 1 {
 				http.Error(w, "unauthorized (set HOTLANE_TOKEN)", http.StatusUnauthorized)
 				return
 			}
@@ -304,6 +314,22 @@ func cmdServe(args []string) {
 		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, front.Target())
 		log.Fatal(http.ListenAndServe(*proxyAddr, front))
 	}()
+
+	if *tlsDomain != "" {
+		// Direct HTTPS: the certificate comes from Let's Encrypt via the
+		// TLS-ALPN challenge, so only the API port itself must be open.
+		if *apiAddr == ":7433" {
+			*apiAddr = ":443"
+		}
+		mgr := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(*tlsDomain),
+			Cache:      autocert.DirCache(filepath.Join(home, ".hotlane", "autocert")),
+		}
+		srv := &http.Server{Addr: *apiAddr, Handler: api, TLSConfig: mgr.TLSConfig()}
+		log.Printf("hotlane %s: API on https://%s%s (app=%q ring=%d)", version, *tlsDomain, *apiAddr, cfg.App, cfg.Ring)
+		log.Fatal(srv.ListenAndServeTLS("", ""))
+	}
 	log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, cfg.App, cfg.Ring)
 	log.Fatal(http.ListenAndServe(*apiAddr, api))
 }

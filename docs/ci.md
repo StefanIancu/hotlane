@@ -12,7 +12,7 @@ hotlane push
 ┌─ CI runner (GitHub Actions, GitLab, CodeBuild, Jenkins...) ─┐
 │  checkout -> test -> hotlane push ──────────────┐           │
 └─────────────────────────────────────────────────┼───────────┘
-                                                  │ HTTPS or SSH tunnel, bearer token
+                                                  │ HTTPS + bearer token
 ┌─ your server (any box with Docker) ─────────────▼───────────┐
 │  hotlane serve: fork -> verify -> flip     app traffic :7480│
 │  archivist (background): clean image -> your registry       │
@@ -37,17 +37,25 @@ Two requirements on the CI side:
 
 ## Reaching the daemon
 
-The API (`:7433`) should never be plainly exposed. Pick one:
+**Recommended: direct HTTPS + token.** The daemon does its own TLS - point a DNS record at your server and start it with a domain:
 
-- **SSH tunnel (recommended default)** - zero server-side setup beyond an SSH key:
-  ```bash
-  ssh -f -N -L 7433:127.0.0.1:7433 deploy@your-server
-  HOTLANE_DAEMON=http://127.0.0.1:7433 hotlane push
-  ```
-- **Private network** - WireGuard, Tailscale, or a VPC: point `HOTLANE_DAEMON` at the private IP.
-- **TLS reverse proxy** - put Caddy/nginx/Traefik in front of `:7433` with TLS and use `HOTLANE_DAEMON=https://deploy.example.com`.
+```bash
+hotlane serve -tls-domain deploy.example.com -token $(openssl rand -hex 24)
+```
 
-In every case, run the daemon with a token (`hotlane serve -token ...` or `HOTLANE_TOKEN`) and give CI the same token as a secret. All API routes except `/healthz` require it.
+Certificates come from Let's Encrypt automatically (TLS-ALPN, so only the API port itself - :443 by default - needs to be open; renewals are handled for you). CI then needs exactly two secrets and zero infrastructure:
+
+```bash
+HOTLANE_DAEMON=https://deploy.example.com HOTLANE_TOKEN=... hotlane push
+```
+
+`-tls-domain` refuses to start without a token, tokens are compared in constant time, and every route except `/healthz` requires one. This is the same trust model as any SaaS API: TLS for the transport, a bearer token for identity.
+
+Alternatives when they fit better:
+
+- **Private network** - if CI and the server already share a VPC or a WireGuard/Tailscale mesh, skip public exposure entirely: `HOTLANE_DAEMON=http://<private-ip>:7433` (still set a token).
+- **Your existing reverse proxy** - already running Traefik/Caddy/nginx with TLS? Front `:7433` with it instead of `-tls-domain`.
+- **SSH tunnel** - for a box with no domain at all: `ssh -f -N -L 7433:127.0.0.1:7433 deploy@server`, then push to `http://127.0.0.1:7433`. Works everywhere SSH does; clunkiest of the four.
 
 ## GitHub Actions
 
@@ -79,17 +87,14 @@ jobs:
           curl -fsSL https://github.com/StefanIancu/hotlane/releases/latest/download/hotlane_linux_amd64.tar.gz \
             | sudo tar -xz -C /usr/local/bin hotlane
 
-      - name: Open tunnel to the daemon
-        run: |
-          install -m 600 /dev/null key && echo "${{ secrets.DEPLOY_SSH_KEY }}" > key
-          ssh -i key -o StrictHostKeyChecking=accept-new \
-              -f -N -L 7433:127.0.0.1:7433 deploy@${{ secrets.DEPLOY_HOST }}
-
       - name: Push
         env:
+          HOTLANE_DAEMON: https://deploy.example.com
           HOTLANE_TOKEN: ${{ secrets.HOTLANE_TOKEN }}
         run: hotlane push
 ```
+
+That's the whole deploy job: install a binary, run one command. (Using a private network or SSH tunnel instead? Add your connectivity step before the push and point `HOTLANE_DAEMON` accordingly.)
 
 The push output (phase timings, verify hooks, PROMOTED/REJECTED) becomes the job log, and a rejected push fails the job with the fork's logs attached.
 
@@ -107,7 +112,7 @@ jobs:
   rollback:
     runs-on: ubuntu-latest
     steps:
-      # ...install + tunnel steps as above...
+      # ...install step as above; HOTLANE_DAEMON + HOTLANE_TOKEN in env...
       - env:
           HOTLANE_TOKEN: ${{ secrets.HOTLANE_TOKEN }}
         run: hotlane rollback ${{ inputs.version }}
@@ -118,7 +123,7 @@ jobs:
 ```yaml
 on:
   schedule: [{ cron: "0 6 * * *" }]
-# ...install + tunnel...
+# ...install step...
 #   run: hotlane drift
 ```
 
@@ -130,24 +135,24 @@ deploy:
   resource_group: production          # serializes deploys
   variables:
     GIT_DEPTH: 0
+    HOTLANE_DAEMON: https://deploy.example.com
   script:
     - curl -fsSL https://github.com/StefanIancu/hotlane/releases/latest/download/hotlane_linux_amd64.tar.gz | tar -xz
-    - install -m 600 /dev/null key && echo "$DEPLOY_SSH_KEY" > key
-    - ssh -i key -o StrictHostKeyChecking=accept-new -f -N -L 7433:127.0.0.1:7433 deploy@$DEPLOY_HOST
     - ./hotlane push
   only: [main]
 ```
 
-Set `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, and `HOTLANE_TOKEN` as protected CI/CD variables.
+Set `HOTLANE_TOKEN` as a protected, masked CI/CD variable.
 
 ## AWS CodeBuild
 
 ```yaml
 version: 0.2
 env:
+  variables:
+    HOTLANE_DAEMON: https://deploy.example.com
   parameter-store:
     HOTLANE_TOKEN: /myapp/hotlane-token
-    DEPLOY_SSH_KEY: /myapp/deploy-ssh-key
 phases:
   install:
     commands:
@@ -155,12 +160,10 @@ phases:
   build:
     commands:
       - git fetch --unshallow || true
-      - install -m 600 /dev/null key && echo "$DEPLOY_SSH_KEY" > key
-      - ssh -i key -o StrictHostKeyChecking=accept-new -f -N -L 7433:127.0.0.1:7433 deploy@$DEPLOY_HOST
       - hotlane push
 ```
 
-(If the daemon host is in the same VPC as CodeBuild, skip the tunnel and set `HOTLANE_DAEMON=http://<private-ip>:7433`.)
+(Daemon host in the same VPC as CodeBuild? Skip public exposure entirely: `HOTLANE_DAEMON=http://<private-ip>:7433`.)
 
 ## Anything else (Jenkins, CircleCI, a cron job, an agent)
 

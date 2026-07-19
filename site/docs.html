@@ -140,7 +140,7 @@ notify: https://hooks.slack.com/services/...</code></pre>
   <div class="tw"><table>
     <tr><th>command</th><th>what it does</th></tr>
     <tr><td><code>hotlane init</code></td><td>Detect the app (Node/TS, FastAPI, Flask, Django, Go), write a commented starter config. <code>-force</code> to overwrite.</td></tr>
-    <tr><td><code>hotlane serve</code></td><td>Run the daemon: warm pool + traffic proxy. Flags: <code>-config</code>, <code>-addr</code> (API, default :7433), <code>-proxy</code> (traffic, default :7480), <code>-token</code>.</td></tr>
+    <tr><td><code>hotlane serve</code></td><td>Run the daemon: warm pool + traffic proxy. Flags: <code>-config</code>, <code>-addr</code> (API, default :7433), <code>-proxy</code> (traffic, default :7480), <code>-token</code>, <code>-tls-domain</code> (built-in HTTPS via Let's Encrypt; API moves to :443; requires a token).</td></tr>
     <tr><td><code>hotlane push</code></td><td>Diff from the daemon's baseline commit to your working tree, fork, verify, promote. <code>-from &lt;ref&gt;</code> overrides the base. Prints phase timings; exits non-zero on rejection with the fork's logs.</td></tr>
     <tr><td><code>hotlane rollback [n]</code></td><td>Flip to the previous version, or to version <code>n</code>. Restarts a stopped ring entry if needed.</td></tr>
     <tr><td><code>hotlane status</code></td><td>Live version, ring with container states, drift verdict, last fork timings.</td></tr>
@@ -163,15 +163,20 @@ notify: https://hooks.slack.com/services/...</code></pre>
 
   <h2 id="ci">CI integration</h2>
   <p>Your pipeline keeps tests and review; the deploy job becomes <code>hotlane push</code>. The daemon records the <strong>baseline commit</strong>, so a CI runner's clean checkout deploys correctly: push diffs baseline&rarr;HEAD.</p>
+  <p>On the server, give the daemon a domain and a token - it does its own TLS (Let's Encrypt, auto-renewed):</p>
+  <pre><code>hotlane serve <span class="a">-tls-domain</span> deploy.example.com <span class="a">-token</span> $(openssl rand -hex 24)</code></pre>
+  <p>Then the deploy job is two secrets and one command - no tunnels, no VPN, no extra infrastructure:</p>
   <pre><code><span class="c"># GitHub Actions deploy job, abridged - full recipes in docs/ci.md</span>
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }              <span class="c"># the diff base must exist locally</span>
 - run: curl -fsSL .../hotlane_linux_amd64.tar.gz | sudo tar -xz -C /usr/local/bin hotlane
-- run: ssh -i key -f -N -L 7433:127.0.0.1:7433 deploy@$HOST
 - run: hotlane push
-  env: { HOTLANE_TOKEN: $&#123;&#123; secrets.HOTLANE_TOKEN &#125;&#125; }</code></pre>
+  env:
+    HOTLANE_DAEMON: https://deploy.example.com
+    HOTLANE_TOKEN: $&#123;&#123; secrets.HOTLANE_TOKEN &#125;&#125;</code></pre>
   <ul>
-    <li><strong>Connectivity</strong>: SSH tunnel (recommended), private network (WireGuard/Tailscale/VPC), or a TLS reverse proxy in front of :7433. Never expose the API bare.</li>
+    <li><strong>Trust model</strong>: TLS for the transport, bearer token for identity - same as any SaaS API. <code>-tls-domain</code> refuses to start without a token; tokens are compared in constant time; only <code>/healthz</code> is open.</li>
+    <li><strong>Already have a private network or reverse proxy?</strong> Use it instead: point <code>HOTLANE_DAEMON</code> at the private IP, or front :7433 with your Traefik/Caddy. An SSH tunnel also works for a box with no domain.</li>
     <li><strong>History</strong>: shallow clones fail loudly - use <code>fetch-depth: 0</code> or <code>git fetch --unshallow</code>.</li>
     <li><strong>Serialization</strong>: one deploy at a time per app (<code>concurrency</code> / <code>resource_group</code>).</li>
     <li>Full worked examples for GitHub Actions, GitLab CI, and AWS CodeBuild - plus a plain-curl recipe for everything else - live in <a href="https://github.com/StefanIancu/hotlane/blob/main/docs/ci.md">docs/ci.md</a>.</li>
