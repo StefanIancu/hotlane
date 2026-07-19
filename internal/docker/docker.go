@@ -4,10 +4,13 @@
 package docker
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // LabelApp marks containers managed by hotlane for a given app.
@@ -87,9 +90,38 @@ func Start(name string) error {
 	return err
 }
 
-// Stop stops a running container.
-func Stop(name string) error {
-	_, err := run("stop", name)
+// Stop stops a running container, giving the app graceSecs to exit cleanly.
+func Stop(name string, graceSecs int) error {
+	_, err := run("stop", "-t", strconv.Itoa(graceSecs), name)
+	return err
+}
+
+// Exec runs a shell command inside a running container and returns its
+// combined output. The command is killed at the timeout.
+func Exec(name, workdir, cmd string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", "-w", workdir, name, "sh", "-c", cmd).CombinedOutput()
+	s := strings.TrimSpace(string(out))
+	if ctx.Err() != nil {
+		return s, fmt.Errorf("timed out after %s", timeout)
+	}
+	if err != nil {
+		return s, fmt.Errorf("exit: %w", err)
+	}
+	return s, nil
+}
+
+// Logs returns the last n lines of a container's output (best effort).
+func Logs(name string, n int) string {
+	out, _ := run("logs", "--tail", strconv.Itoa(n), name)
+	return out
+}
+
+// RemoveImage force-removes an image (best effort cleanup of fork
+// snapshots; discarded forks must not stack images on disk).
+func RemoveImage(imageRef string) error {
+	_, err := run("rmi", "-f", imageRef)
 	return err
 }
 

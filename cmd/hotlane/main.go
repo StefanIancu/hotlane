@@ -19,11 +19,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/proxy"
+	"github.com/StefanIancu/hotlane/internal/verify"
 )
+
+// pushResponse is the daemon's answer to a push: the fork, the verify
+// verdict, and (on failure) the fork's dying words.
+type pushResponse struct {
+	*pool.ForkResult
+	Verify   []verify.Result `json:"verify"`
+	VerifyMs int64           `json:"verify_ms"`
+	Promoted bool            `json:"promoted"`
+	Logs     string          `json:"logs,omitempty"`
+}
 
 const version = "0.0.1-dev"
 
@@ -101,20 +114,41 @@ func cmdServe(args []string) {
 			"last_fork": p.LastFork,
 		})
 	})
+	// Pushes are serialized: forks share the shadow tree and the version
+	// counter, and one verified promote at a time is the contract.
+	var pushMu sync.Mutex
 	mux.HandleFunc("POST /v1/push", func(w http.ResponseWriter, r *http.Request) {
 		diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		pushMu.Lock()
+		defer pushMu.Unlock()
+
 		res, err := p.Fork(diff)
 		if err != nil {
 			log.Printf("push: %v", err)
 			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
+		out := pushResponse{ForkResult: res}
+
+		vStart := time.Now()
+		out.Verify, out.Promoted = verify.Run(cfg, res.Container, res.Backend)
+		out.VerifyMs = time.Since(vStart).Milliseconds()
+		out.TotalMs += out.VerifyMs
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(res)
+		if !out.Promoted {
+			out.Logs = p.Discard(res)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+		p.Promote(res)
+		front.Set(res.Backend)
+		json.NewEncoder(w).Encode(out)
 	})
 
 	go func() {
@@ -149,14 +183,29 @@ func cmdPush(args []string) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+
+	var res pushResponse
+	if err := json.Unmarshal(body, &res); err != nil {
 		log.Fatalf("hotlane push: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
 	}
-	var res pool.ForkResult
-	if err := json.Unmarshal(body, &res); err != nil {
-		log.Fatalf("hotlane push: bad response: %v", err)
+	fmt.Printf("fork %s (v%d): snapshot %dms | patch %dms | boot %dms | verify %dms\n",
+		res.Container, res.Version, res.SnapshotMs, res.PatchMs, res.BootMs, res.VerifyMs)
+	for _, v := range res.Verify {
+		mark := "ok  "
+		if !v.OK {
+			mark = "FAIL"
+		}
+		fmt.Printf("  %s %s (%dms)", mark, v.Hook, v.Ms)
+		if v.Detail != "" {
+			fmt.Printf(" - %s", v.Detail)
+		}
+		fmt.Println()
 	}
-	fmt.Printf("forked %s (v%d) at %s\n", res.Container, res.Version, res.Backend)
-	fmt.Printf("  snapshot %dms | patch %dms | boot %dms | total %dms\n",
-		res.SnapshotMs, res.PatchMs, res.BootMs, res.TotalMs)
+	if !res.Promoted {
+		if res.Logs != "" {
+			fmt.Printf("--- fork logs ---\n%s\n", res.Logs)
+		}
+		log.Fatalf("push REJECTED after %dms: fork destroyed, live version untouched", res.TotalMs)
+	}
+	fmt.Printf("PROMOTED v%d live in %dms\n", res.Version, res.TotalMs)
 }

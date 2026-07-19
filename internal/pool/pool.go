@@ -51,6 +51,10 @@ func containerName(app string, version int) string {
 	return fmt.Sprintf("hotlane-%s-v%d", app, version)
 }
 
+func (p *Pool) imageRef(version int) string {
+	return fmt.Sprintf("hotlane-%s:v%d", p.Cfg.App, version)
+}
+
 // command is what the container runs: the incremental build (when
 // configured) chained before the run command, so every container boot
 // rebuilds against its own warm caches.
@@ -156,7 +160,7 @@ func (p *Pool) Fork(diff []byte) (*ForkResult, error) {
 
 	// Snapshot: the fork's image is the live container's filesystem, warm
 	// caches included.
-	imageRef := fmt.Sprintf("hotlane-%s:v%d", p.Cfg.App, res.Version)
+	imageRef := p.imageRef(res.Version)
 	if err := docker.Commit(p.Live, imageRef); err != nil {
 		return nil, err
 	}
@@ -213,6 +217,40 @@ func (p *Pool) Fork(diff []byte) (*ForkResult, error) {
 	log.Printf("pool: fork %s ready at %s (snapshot %dms, patch %dms, boot %dms, total %dms)",
 		name, addr, res.SnapshotMs, res.PatchMs, res.BootMs, res.TotalMs)
 	return res, nil
+}
+
+// Promote makes a verified fork the live version. The previous live
+// container is stopped in the background (it keeps its filesystem and
+// becomes a ring entry) so the flip itself costs nothing.
+func (p *Pool) Promote(res *ForkResult) (old string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old = p.Live
+	p.Live, p.Backend, p.Version = res.Container, res.Backend, res.Version
+	if old != "" && old != res.Container {
+		go func() {
+			if err := docker.Stop(old, 5); err != nil {
+				log.Printf("pool: stopping superseded %s: %v", old, err)
+			}
+		}()
+	}
+	log.Printf("pool: promoted %s (v%d), superseded %s", res.Container, res.Version, old)
+	return old
+}
+
+// Discard destroys a failed fork (container and snapshot image - failed
+// pushes must not stack images on disk) and returns its last log lines
+// for the pusher.
+func (p *Pool) Discard(res *ForkResult) string {
+	logs := docker.Logs(res.Container, 50)
+	if err := docker.Remove(res.Container); err != nil {
+		log.Printf("pool: discarding %s: %v", res.Container, err)
+	}
+	if err := docker.RemoveImage(p.imageRef(res.Version)); err != nil {
+		log.Printf("pool: discarding image %s: %v", p.imageRef(res.Version), err)
+	}
+	log.Printf("pool: discarded failed fork %s", res.Container)
+	return logs
 }
 
 func (p *Pool) pristineDir() string { return filepath.Join(p.DataDir, "pristine") }
