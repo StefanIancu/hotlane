@@ -2,3 +2,7 @@
 /dist/
 *.test
 .DS_Store
+packaging/pypi/dist/
+packaging/pypi/src/hotlane.egg-info/
+packaging/crates/target/
+packaging/crates/Cargo.lock

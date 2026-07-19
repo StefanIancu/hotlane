@@ -1,0 +1,10 @@
+[package]
+name = "hotlane"
+version = "0.0.1"
+edition = "2021"
+description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer. Name reserved while the MVP is built."
+license = "MIT"
+repository = "https://github.com/StefanIancu/hotlane"
+homepage = "https://github.com/StefanIancu/hotlane"
+keywords = ["deployment", "ci-cd", "rollback", "devops"]
+categories = ["development-tools"]
