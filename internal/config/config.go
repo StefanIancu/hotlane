@@ -6,7 +6,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,6 +56,16 @@ type Config struct {
 	Ring    int          `yaml:"ring"`
 	Archive string       `yaml:"archive"`
 	Notify  string       `yaml:"notify"` // webhook URL for drift/rejection events (Slack/Discord compatible)
+
+	// Src is the app's source checkout. Optional in single-config mode
+	// (defaults to the config file's directory); required in a multi-app
+	// directory, where configs live in /etc/hotlane/apps and can't imply
+	// their source location. Relative paths resolve against the config
+	// file's directory.
+	Src string `yaml:"src,omitempty"`
+	// Domain routes app traffic by Host header on the shared listeners
+	// and names the TLS certificate in multi-app mode (docs/multi-app.md).
+	Domain string `yaml:"domain,omitempty"`
 }
 
 // Load reads and validates a hotlane.yml.
@@ -72,10 +84,66 @@ func Load(path string) (*Config, error) {
 	if c.Workdir == "" {
 		c.Workdir = "/app"
 	}
+	if c.Src != "" && !filepath.IsAbs(c.Src) {
+		if abs, err := filepath.Abs(filepath.Join(filepath.Dir(path), c.Src)); err == nil {
+			c.Src = abs
+		}
+	}
 	if err := c.interpolate(); err != nil {
 		return nil, err
 	}
 	return &c, c.validate()
+}
+
+// LoadDir reads every *.yml in dir as one app each - the multi-app
+// daemon's configuration surface. Validation is all-or-nothing across the
+// set: duplicate app names, duplicate domains, or a missing src refuse
+// the whole load with every problem listed. A half-loaded daemon that
+// silently skipped one config is how apps disappear unnoticed.
+func LoadDir(dir string) ([]*Config, error) {
+	paths, err := filepath.Glob(filepath.Join(dir, "*.yml"))
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no *.yml configs in %s", dir)
+	}
+	sort.Strings(paths)
+
+	var (
+		configs  []*Config
+		problems []string
+		byApp    = map[string]string{}
+		byDomain = map[string]string{}
+	)
+	for _, p := range paths {
+		name := filepath.Base(p)
+		c, err := Load(p)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		if prev, dup := byApp[c.App]; dup {
+			problems = append(problems, fmt.Sprintf("%s: app %q already defined in %s", name, c.App, prev))
+		}
+		byApp[c.App] = name
+		if c.Domain != "" {
+			if prev, dup := byDomain[c.Domain]; dup {
+				problems = append(problems, fmt.Sprintf("%s: domain %q already routed to %s", name, c.Domain, prev))
+			}
+			byDomain[c.Domain] = name
+		}
+		if c.Src == "" {
+			problems = append(problems, fmt.Sprintf("%s: src: is required in a multi-app directory (the checkout to snapshot/diff against)", name))
+		} else if fi, err := os.Stat(c.Src); err != nil || !fi.IsDir() {
+			problems = append(problems, fmt.Sprintf("%s: src %q is not a directory", name, c.Src))
+		}
+		configs = append(configs, c)
+	}
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("invalid app directory %s:\n  %s", dir, strings.Join(problems, "\n  "))
+	}
+	return configs, nil
 }
 
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
@@ -119,6 +187,9 @@ func (c *Config) validate() error {
 	}
 	if c.Port == 0 {
 		problems = append(problems, "port: app port is required")
+	}
+	if strings.ContainsAny(c.Domain, "/: ") {
+		problems = append(problems, fmt.Sprintf("domain: %q must be a bare hostname (no scheme, port, or path)", c.Domain))
 	}
 	for i, h := range c.Verify {
 		if (h.HTTP == "") == (h.Run == "") {

@@ -177,9 +177,14 @@ func cmdServe(args []string) {
 	if err != nil {
 		log.Fatalf("hotlane: %v", err)
 	}
-	src, err := filepath.Abs(filepath.Dir(*cfgPath))
-	if err != nil {
-		log.Fatalf("hotlane: %v", err)
+	// The source checkout: src: from the config when set (Load already
+	// resolved it against the config's directory), else the config's
+	// directory itself - serve traditionally starts inside the repo.
+	src := cfg.Src
+	if src == "" {
+		if src, err = filepath.Abs(filepath.Dir(*cfgPath)); err != nil {
+			log.Fatalf("hotlane: %v", err)
+		}
 	}
 
 	a, err := newAppRuntime(cfg, src, dataRoot())

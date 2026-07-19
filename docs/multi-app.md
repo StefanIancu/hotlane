@@ -153,9 +153,11 @@ instant.
 1. **Refactor, no behavior change**: extract `appRuntime` + constructor from
    cmdServe; single-app mode wires exactly one. e2e must pass untouched.
 2. **Config**: `src:` field (with single-app inference fallback), `domain:`
-   field, `-apps DIR` flag, startup validation across the set.
-3. **Routing**: host map on the proxy path, `/-/v1/apps/<app>/` API routes,
-   single-app aliases, `/-/v1/apps` index, autocert union.
+   field, `config.LoadDir` with all-or-nothing validation across the set.
+3. **Routing**: the `-apps DIR` flag (a flag that parses a directory but
+   can't route N apps yet would be a lie - it lands with the routing),
+   host map on the proxy path, `/-/v1/apps/<app>/` API routes, single-app
+   aliases, `/-/v1/apps` index, autocert union.
 4. **CLI**: clients target namespaced paths with fallback; `status -all`.
 5. **Shared plumbing**: build semaphore, staggered drift ticker.
 6. **e2e**: new scenario - two apps from one `-apps` dir, host-routed pushes,
