@@ -21,7 +21,7 @@ Last updated: 2026-07-19 (v0.5.0).
 ## Next
 
 Roughly ordered; dogfooding findings marked (df). Open an issue if your priority differs.
-- **Traffic-replay verification** - mirror a slice of live requests into the fork and diff responses before promoting
+- **Traffic-replay verification** - replay a recorded slice of live requests against the fork and diff responses before promoting ([design sketch](traffic-replay.md); reuses the drift normalizer, report-then-gate modes, reads-only by default)
 - **Browser-clickable fork previews** - subdomain-per-held-fork (needs wildcard DNS/DNS-01; the header covers agents today)
 - **Database branching hooks** - integrate branchable storage (Neon, ZFS/LVM snapshots) so forks can get forked state
 - **Multi-host** - a version ring gossiped across daemons behind a shared load balancer
