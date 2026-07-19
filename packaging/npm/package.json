@@ -1,14 +1,18 @@
 {
   "name": "hotlane",
-  "version": "0.0.1",
-  "description": "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer. Name reserved while the MVP is built.",
+  "version": "0.1.0",
+  "description": "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer.",
   "license": "MIT",
   "author": "Stefan Iancu",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/StefanIancu/hotlane.git"
   },
-  "homepage": "https://github.com/StefanIancu/hotlane",
+  "homepage": "https://hotlane.dev",
   "keywords": ["deployment", "ci-cd", "rollback", "warm-deploy", "agentic"],
-  "files": ["README.md"]
+  "bin": { "hotlane": "bin/hotlane.js" },
+  "scripts": { "postinstall": "node install.js" },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"],
+  "files": ["README.md", "install.js", "bin/hotlane.js"]
 }

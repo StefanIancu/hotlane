@@ -43,7 +43,8 @@ type pushResponse struct {
 	Logs     string          `json:"logs,omitempty"`
 }
 
-const version = "0.0.1-dev"
+// version is stamped by goreleaser at release time (-X main.version=...).
+var version = "0.0.1-dev"
 
 func main() {
 	log.SetFlags(0)

@@ -6,3 +6,5 @@ packaging/pypi/dist/
 packaging/pypi/src/hotlane.egg-info/
 packaging/crates/target/
 packaging/crates/Cargo.lock
+/dist/
+packaging/npm/bin/hotlane
