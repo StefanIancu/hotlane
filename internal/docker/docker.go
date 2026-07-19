@@ -25,17 +25,25 @@ func run(args ...string) (string, error) {
 	return s, nil
 }
 
-// Running returns the names of running hotlane containers for app,
-// newest version first (names sort lexically only within same width, so
-// callers should rely on version labels for ordering beyond v9).
+// Running returns the names of running hotlane containers for app, oldest
+// version first. Until promote lands (M3) the live instance is always the
+// lowest running version: forks boot at higher versions and stay side-lined.
 func Running(app string) ([]string, error) {
 	out, err := run("ps", "--filter", "label="+LabelApp+"="+app, "--format", "{{.Names}}")
 	if err != nil || out == "" {
 		return nil, err
 	}
 	names := strings.Split(out, "\n")
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	sort.Strings(names)
 	return names, nil
+}
+
+// Commit snapshots a container's filesystem into an image. Running
+// containers are paused briefly; this is what makes forks inherit the warm
+// state (dependencies, build caches) for free.
+func Commit(name, imageRef string) error {
+	_, err := run("commit", name, imageRef)
+	return err
 }
 
 // Exists reports whether a container (any state) with this name exists.
