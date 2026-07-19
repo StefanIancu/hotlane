@@ -20,7 +20,7 @@ Last updated: 2026-07-19 (v0.4.2).
 
 Roughly ordered; dogfooding findings marked (df). Open an issue if your priority differs.
 
-- **Multi-app daemons** - one daemon serving several hotlane.yml apps on one host
+- **Multi-app daemons** - one daemon serving several hotlane.yml apps on one host ([design sketch](multi-app.md); static config directory, host-header routing, per-app machinery behind shared listeners)
 - **Traffic-replay verification** - mirror a slice of live requests into the fork and diff responses before promoting
 - **Browser-clickable fork previews** - subdomain-per-held-fork (needs wildcard DNS/DNS-01; the header covers agents today)
 - **Database branching hooks** - integrate branchable storage (Neon, ZFS/LVM snapshots) so forks can get forked state
