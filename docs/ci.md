@@ -59,6 +59,8 @@ Alternatives when they fit better:
 
 ## GitHub Actions
 
+Use the published action - [`StefanIancu/hotlane-action`](https://github.com/marketplace/actions/hotlane-deploy) wraps install + any client command and surfaces the verify verdict as outputs and a job summary:
+
 ```yaml
 name: deploy
 on:
@@ -81,50 +83,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0                       # the diff base must exist locally
+      - uses: StefanIancu/hotlane-action@v1
+        with:
+          daemon: ${{ vars.HOTLANE_DAEMON }}
+          token: ${{ secrets.HOTLANE_TOKEN }}
+```
 
+That's the whole deploy job. (Using a private network or SSH tunnel? Add your connectivity step before it and point `daemon` accordingly.) A rejected push fails the job with the verify results and the fork's dying logs; a promoted one writes the phase timings and verify table to the job summary. `command: rollback` / `command: drift` (with `args` where needed) cover [manual rollback and scheduled drift-check workflows](https://github.com/StefanIancu/hotlane-action#manual-rollback) the same way.
+
+Prefer raw steps? The action is sugar over exactly this:
+
+```yaml
       - name: Install hotlane
         run: |
           curl -fsSL https://github.com/StefanIancu/hotlane/releases/latest/download/hotlane_linux_amd64.tar.gz \
             | sudo tar -xz -C /usr/local/bin hotlane
-
       - name: Push
         env:
           HOTLANE_DAEMON: https://deploy.example.com
           HOTLANE_TOKEN: ${{ secrets.HOTLANE_TOKEN }}
         run: hotlane push
-```
-
-That's the whole deploy job: install a binary, run one command. (Using a private network or SSH tunnel instead? Add your connectivity step before the push and point `HOTLANE_DAEMON` accordingly.)
-
-The push output (phase timings, verify hooks, PROMOTED/REJECTED) becomes the job log, and a rejected push fails the job with the fork's logs attached.
-
-**Rollback as a manual action:**
-
-```yaml
-name: rollback
-on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "version to roll back to (empty = previous)"
-        required: false
-jobs:
-  rollback:
-    runs-on: ubuntu-latest
-    steps:
-      # ...install step as above; HOTLANE_DAEMON + HOTLANE_TOKEN in env...
-      - env:
-          HOTLANE_TOKEN: ${{ secrets.HOTLANE_TOKEN }}
-        run: hotlane rollback ${{ inputs.version }}
-```
-
-**Drift check as a scheduled job** - `hotlane drift` exits non-zero on drift, so a red scheduled run is your alarm (on top of the daemon's own `notify:` webhook):
-
-```yaml
-on:
-  schedule: [{ cron: "0 6 * * *" }]
-# ...install step...
-#   run: hotlane drift
 ```
 
 ## GitLab CI
@@ -183,6 +161,20 @@ The response is JSON: fork phase timings, per-hook verify results, `promoted` tr
 hotlane runs **on a machine you own with Docker**: a VPS, bare metal, an EC2 instance. It does not run on ECS, Fargate, Cloud Run, or Kubernetes, and not inside your app's image - it works by commanding the host's Docker daemon (forking live containers, keeping the version ring, fronting them with its proxy), which is exactly the layer managed platforms own themselves. hotlane is an alternative to that layer, not a passenger on it: the AWS equivalent of an ECS service is one EC2 instance running `hotlane serve`.
 
 Teams keeping a managed platform for prod can split the loops: hotlane on a cheap box for dev/staging/agent iteration, while the archivist's registry-pushed, from-source images feed the existing prod pipeline - every archived version is a normal image ECS or Kubernetes can deploy directly.
+
+## Running the daemon under systemd
+
+On the box itself, run `hotlane serve` as a service so it survives reboots. A ready unit file ships in [`packaging/systemd/hotlane.service`](../packaging/systemd/hotlane.service):
+
+```bash
+sudo useradd -r -G docker -s /usr/sbin/nologin hotlane
+sudo cp packaging/systemd/hotlane.service /etc/systemd/system/
+sudo sh -c 'mkdir -p /etc/hotlane && echo HOTLANE_TOKEN=$(openssl rand -hex 24) > /etc/hotlane/env && chmod 600 /etc/hotlane/env'
+# edit WorkingDirectory in the unit to your app checkout, then:
+sudo systemctl enable --now hotlane
+```
+
+Services run without `$HOME`, so the daemon keeps its state (fork ring, clean-image snapshots, autocert cache) in `/var/lib/hotlane` - `StateDirectory=hotlane` in the unit has systemd create it with the right ownership. Secrets stay in `/etc/hotlane/env`: `HOTLANE_TOKEN` becomes the API token, and any `${VAR}` references in `hotlane.yml` (e.g. `notify: ${HOTLANE_NOTIFY_URL}`) interpolate from the same file.
 
 ## Where the trust guarantees live
 

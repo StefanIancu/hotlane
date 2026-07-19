@@ -176,8 +176,10 @@ func (g *Guess) YAML() string {
 	fmt.Fprintf(&b, "port: %d\n", g.Port)
 	b.WriteString("verify:\n")
 	b.WriteString("  - http: / == 200        # add a real /health endpoint and check it here\n")
+	b.WriteString("  #  timeout: 5s          # optional per-hook budget (defaults: http 15s, run 60s)\n")
 	b.WriteString("ring: 5                   # versions kept for instant rollback\n")
 	b.WriteString("# archive: registry/ref   # push the archivist's clean images here\n")
-	b.WriteString("# notify: https://...     # webhook for drift + rejected-push events\n")
+	b.WriteString("# notify: ${HOTLANE_NOTIFY_URL}  # webhook for drift + rejected-push events;\n")
+	b.WriteString("#                         # ${VAR} interpolates from the daemon's environment\n")
 	return b.String()
 }

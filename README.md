@@ -92,11 +92,14 @@ run: node dist/server.js
 port: 3000
 verify:
   - http: /health == 200
+    timeout: 5s               # optional; defaults: 15s for http, 60s for run
   - run: ./smoke.sh
 ring: 5                       # versions kept for instant rollback
 archive: ghcr.io/acme/api     # registry ref for the archivist's clean images
-notify: https://hooks.slack.com/services/...  # drift detected/healed, push rejected
+notify: ${HOTLANE_NOTIFY_URL} # drift detected/healed, push rejected (Slack/Discord)
 ```
+
+`notify` and `archive` interpolate `${VAR}` from the daemon's environment, so webhook URLs and registry refs never have to live in a committed file (an unset variable fails the load loudly). Build/run/verify scripts are left untouched - their `${VAR}`s belong to the shell inside the container. For running the daemon as a service, a systemd unit ships in [`packaging/systemd/`](packaging/systemd/hotlane.service) ([guide](docs/ci.md#running-the-daemon-under-systemd)); without `$HOME`, state lands in `/var/lib/hotlane`.
 
 ## CLI
 
@@ -130,7 +133,7 @@ DRIFTED: behavior differs on /: clean build serves "hello", live serves "TAMPERE
 next push will rebuild from hotlane-api:clean
 ```
 
-Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. The clean image also keeps the fast lane sustainable: fork chains auto-rebase onto it every ~40 pushes, so agent-speed pushing never hits Docker's layer-depth limit. Fast lane and audit trail, both real.
+The comparison is behavior-based and tolerant of dynamic content: timestamps, UUIDs, request ids and the like are masked, and anything that differs between two requests to the *same* instance is excluded as evidence (status codes always compare) - so a `/health` that reports uptime doesn't cry wolf. Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. The clean image also keeps the fast lane sustainable: fork chains auto-rebase onto it every ~40 pushes, so agent-speed pushing never hits Docker's layer-depth limit. Fast lane and audit trail, both real.
 
 ## Built for agent loops
 

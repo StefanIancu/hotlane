@@ -81,6 +81,8 @@ func main() {
 		cmdMCP(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("hotlane", version)
+	case "help", "-h", "--help":
+		usage()
 	default:
 		usage()
 		os.Exit(2)
@@ -153,6 +155,16 @@ func cmdInit(args []string) {
 	fmt.Println("review it - especially the verify hooks - then run: hotlane serve")
 }
 
+// dataRoot is where the daemon keeps per-app state: ~/.hotlane normally,
+// /var/lib/hotlane when there is no home directory (systemd services with
+// DynamicUser or no User= often run without $HOME).
+func dataRoot() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".hotlane")
+	}
+	return "/var/lib/hotlane"
+}
+
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "hotlane.yml", "path to hotlane.yml")
@@ -175,11 +187,8 @@ func cmdServe(args []string) {
 		log.Fatalf("hotlane: %v", err)
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("hotlane: %v", err)
-	}
-	p := &pool.Pool{Cfg: cfg, Src: src, DataDir: filepath.Join(home, ".hotlane", cfg.App)}
+	root := dataRoot()
+	p := &pool.Pool{Cfg: cfg, Src: src, DataDir: filepath.Join(root, cfg.App)}
 	if err := p.Ensure(); err != nil {
 		log.Fatalf("hotlane: warm pool: %v", err)
 	}
@@ -524,7 +533,7 @@ func cmdServe(args []string) {
 		mgr := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(*tlsDomain),
-			Cache:      autocert.DirCache(filepath.Join(home, ".hotlane", "autocert")),
+			Cache:      autocert.DirCache(filepath.Join(root, "autocert")),
 		}
 		shared := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/-" || strings.HasPrefix(r.URL.Path, "/-/") {

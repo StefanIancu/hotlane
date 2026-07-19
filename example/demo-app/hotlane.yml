@@ -4,5 +4,6 @@ run: node server.js
 port: 3000
 verify:
   - http: /health == 200
+    timeout: 30s      # optional per-hook budget (defaults: http 15s, run 60s)
   - http: / == 200
 ring: 3

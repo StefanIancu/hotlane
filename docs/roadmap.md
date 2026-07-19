@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-07-19 (v0.4.1).
+Last updated: 2026-07-19 (v0.4.2).
 
 ## Shipped
 
@@ -12,15 +12,14 @@ Last updated: 2026-07-19 (v0.4.1).
 
 **v0.4** - agent-native surfaces: `hotlane mcp` (eight typed tools over stdio), `-json` on every state-touching command, self-describing `GET /-/v1`, and [llms-full.txt](https://hotlane.dev/llms-full.txt) - the complete one-fetch operating contract.
 
+**v0.4.2** - the three dogfooding papercuts: `${VAR}` interpolation in `notify`/`archive` (secrets out of committed config; unset var fails loudly), per-hook `timeout:` on verify checks, and systemd friendliness (`/var/lib/hotlane` fallback when `$HOME` is unset + a shipped [unit file](../packaging/systemd/hotlane.service)). Plus drift checks that stop false-positiving on dynamic content: volatile patterns (timestamps, UUIDs, hex ids, epoch numbers) are masked before comparing, and each instance is sampled twice so anything that differs between two requests to the same server is excluded as evidence - status codes still always compare.
+
+**GitHub Action** - [`StefanIancu/hotlane-action@v1`](https://github.com/marketplace/actions/hotlane-deploy) on the Marketplace: install + any client command, verify verdict as outputs and a job summary ([integration guide](ci.md#github-actions)).
+
 ## Next
 
 Roughly ordered; dogfooding findings marked (df). Open an issue if your priority differs.
 
-- **Env interpolation in hotlane.yml** (df) - `notify: ${HOTLANE_NOTIFY_URL}` so secrets never live in committed config; blocks webhook use in public repos today
-- **Verify budget knobs** (df) - per-hook timeouts; a rejected push currently burns each failing http hook's full 15s budget
-- **systemd friendliness** (df) - fall back to `/var/lib/hotlane` when `$HOME` is unset; ship a unit file in the docs/install
-- **GitHub Action** - a published marketplace action wrapping install + push
-- **Response normalization for drift checks** - tolerate timestamps/request IDs on hook paths (dynamic content currently false-positives, by documented design)
 - **Multi-app daemons** - one daemon serving several hotlane.yml apps on one host
 - **Traffic-replay verification** - mirror a slice of live requests into the fork and diff responses before promoting
 - **Browser-clickable fork previews** - subdomain-per-held-fork (needs wildcard DNS/DNS-01; the header covers agents today)

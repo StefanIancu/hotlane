@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -259,8 +260,14 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 	return a.status
 }
 
-// compareResponses diffs the body and status of every http verify hook
-// path between the cold boot and live. Returns "" when they match.
+// compareResponses diffs the behavior of every http verify hook path
+// between the cold boot and live. Returns "" when they match.
+//
+// Bodies are compared after normalization (timestamps, UUIDs, hex ids,
+// epoch-scale numbers become placeholders), and each instance is sampled
+// twice: whatever still differs between two requests to the SAME server
+// is dynamic content, which cannot be evidence of drift either way - for
+// such paths only the status code is compared.
 func compareResponses(cfg *config.Config, coldAddr, liveAddr string) string {
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, h := range cfg.Verify {
@@ -268,30 +275,80 @@ func compareResponses(cfg *config.Config, coldAddr, liveAddr string) string {
 			continue
 		}
 		path := strings.TrimSpace(strings.SplitN(h.HTTP, "==", 2)[0])
-		cold, cerr := get(client, coldAddr, path)
-		live, lerr := get(client, liveAddr, path)
+		cold, cerr := sample(client, coldAddr, path)
+		live, lerr := sample(client, liveAddr, path)
 		if cerr != nil || lerr != nil {
 			return fmt.Sprintf("comparing %s: cold=%v live=%v", path, cerr, lerr)
 		}
-		if cold != live {
+		if cold.status != live.status {
+			return fmt.Sprintf("behavior differs on %s: clean build answers %d, live answers %d",
+				path, cold.status, live.status)
+		}
+		if cold.dynamic || live.dynamic {
+			log.Printf("archive: drift check: %s is dynamic (differs between two requests to the same instance); comparing status only", path)
+			continue
+		}
+		if cold.body != live.body {
 			return fmt.Sprintf("behavior differs on %s: clean build serves %q, live serves %q",
-				path, truncate(cold, 120), truncate(live, 120))
+				path, truncate(cold.body, 120), truncate(live.body, 120))
 		}
 	}
 	return ""
 }
 
-func get(c *http.Client, addr, path string) (string, error) {
+// volatile are content patterns that legitimately vary between two builds
+// of the same source: masked before bodies are compared. Order matters -
+// timestamps go before the bare-number rule.
+var volatile = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?`), "<ts>"}, // ISO 8601
+	{regexp.MustCompile(`(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT`), "<ts>"}, // RFC 1123
+	{regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), "<uuid>"},
+	{regexp.MustCompile(`\b[0-9a-fA-F]{16,64}\b`), "<hex>"},   // request ids, hashes
+	{regexp.MustCompile(`\b\d{10,19}\b`), "<num>"},            // unix seconds/millis, counters
+}
+
+// normalize masks volatile content so it never reads as drift.
+func normalize(body string) string {
+	for _, v := range volatile {
+		body = v.re.ReplaceAllString(body, v.repl)
+	}
+	return body
+}
+
+// sampled is one path's observed behavior: two requests, normalized.
+type sampled struct {
+	status  int
+	body    string // first normalized body
+	dynamic bool   // normalized bodies differed between the two requests
+}
+
+func sample(c *http.Client, addr, path string) (sampled, error) {
+	s1, b1, err := get(c, addr, path)
+	if err != nil {
+		return sampled{}, err
+	}
+	s2, b2, err := get(c, addr, path)
+	if err != nil {
+		return sampled{}, err
+	}
+	n1, n2 := normalize(b1), normalize(b2)
+	return sampled{status: s1, body: n1, dynamic: n1 != n2 || s1 != s2}, nil
+}
+
+func get(c *http.Client, addr, path string) (int, string, error) {
 	resp, err := c.Get("http://" + addr + path)
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
-	return fmt.Sprintf("%d %s", resp.StatusCode, body), nil
+	return resp.StatusCode, string(body), nil
 }
 
 func truncate(s string, n int) string {

@@ -1,0 +1,38 @@
+# hotlane.service - run the hotlane daemon under systemd.
+#
+# Install:
+#   sudo useradd -r -G docker -s /usr/sbin/nologin hotlane   # dedicated user with Docker access
+#   sudo cp hotlane.service /etc/systemd/system/
+#   # edit WorkingDirectory below, and put HOTLANE_TOKEN in /etc/hotlane/env
+#   sudo systemctl enable --now hotlane
+#
+# Services run without $HOME, so hotlane keeps its state in
+# /var/lib/hotlane automatically; StateDirectory has systemd create and
+# own it for the service user.
+
+[Unit]
+Description=hotlane - instant verified deploys
+Documentation=https://hotlane.dev
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+User=hotlane
+Group=docker
+# The app checkout containing hotlane.yml.
+WorkingDirectory=/srv/myapp
+# One line: HOTLANE_TOKEN=...  (kept out of the unit and the repo;
+# serve picks it up as the API token, and ${VAR} refs in hotlane.yml
+# interpolate from here too)
+EnvironmentFile=/etc/hotlane/env
+ExecStart=/usr/local/bin/hotlane serve
+Restart=on-failure
+RestartSec=2
+StateDirectory=hotlane
+
+# Uncomment when using -tls-domain: binding :443/:80 as non-root.
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
