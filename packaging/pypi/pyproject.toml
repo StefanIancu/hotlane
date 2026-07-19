@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hotlane"
-version = "0.2.1"
+version = "0.2.2"
 description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer."
 readme = "README.md"
 license = { text = "MIT" }
