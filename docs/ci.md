@@ -176,7 +176,7 @@ git diff "$BASE" --relative \
       --data-binary @- "$HOTLANE_DAEMON/-/v1/push"
 ```
 
-The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /-/v1/rollback` (`{"version": N}` or empty for previous) and `POST /-/v1/drift-check` complete the surface. (On the private API port, bare `/v1/...` paths work as aliases.)
+The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /-/v1/test` (same body) holds the verified fork instead of promoting - reach it with the `X-Hotlane-Fork: <version>` header on the app URL, then `POST /-/v1/promote` or `/-/v1/discard` (`{"version": N}`). `POST /-/v1/rollback` and `POST /-/v1/drift-check` complete the surface. (On the private API port, bare `/v1/...` paths work as aliases.)
 
 ## Where does hotlane run (and not run)?
 

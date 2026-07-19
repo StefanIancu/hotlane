@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +24,9 @@ import (
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/docker"
 )
+
+// maxHeld caps concurrently held forks: each holds a running container.
+const maxHeld = 3
 
 // Pool tracks the live version of one app.
 type Pool struct {
@@ -36,6 +42,8 @@ type Pool struct {
 	Backend  string // loopback host:port the proxy targets
 	Version  int
 	LastFork *ForkResult
+
+	held map[int]*HeldFork // test-mode forks awaiting promote/discard
 
 	// BaselineCommit is the git commit the pristine snapshot was taken at
 	// (empty if the source is not a git checkout). Diffs are applied
@@ -476,6 +484,132 @@ func (p *Pool) ensurePristine() error {
 		log.Printf("pool: baseline commit %s", p.BaselineCommit[:12])
 	}
 	return nil
+}
+
+// HeldFork is a booted, verified fork that is NOT serving traffic: the
+// caller pokes it (via the X-Hotlane-Fork header), then promotes or
+// discards it. Its source tree is retained so a later promote archives
+// the right code even if newer pushes reset the shadow in between.
+type HeldFork struct {
+	Result    *ForkResult
+	ExpiresAt time.Time
+	SrcDir    string
+	proxy     *httputil.ReverseProxy
+}
+
+// Hold registers a just-forked instance as held. Call under the same
+// serialization as Fork, before any newer fork resets the shadow.
+func (p *Pool) Hold(res *ForkResult, ttl time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.held == nil {
+		p.held = map[int]*HeldFork{}
+	}
+	if len(p.held) >= maxHeld {
+		return fmt.Errorf("%d forks already held - promote or discard one first", maxHeld)
+	}
+	src := filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", res.Version))
+	if err := os.RemoveAll(src); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		return err
+	}
+	if err := copyTree(p.ShadowDir(), src); err != nil {
+		return err
+	}
+	p.held[res.Version] = &HeldFork{
+		Result:    res,
+		ExpiresAt: time.Now().Add(ttl),
+		SrcDir:    src,
+		proxy:     httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: res.Backend}),
+	}
+	log.Printf("pool: holding fork v%d at %s until %s", res.Version, res.Backend, p.held[res.Version].ExpiresAt.Format(time.RFC3339))
+	return nil
+}
+
+// HeldProxy returns the reverse proxy for a held fork, or nil.
+func (p *Pool) HeldProxy(version int) http.Handler {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h, ok := p.held[version]; ok {
+		return h.proxy
+	}
+	return nil
+}
+
+// HeldList summarizes held forks for status.
+func (p *Pool) HeldList() []map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]map[string]any, 0, len(p.held))
+	for v, h := range p.held {
+		out = append(out, map[string]any{
+			"version":    v,
+			"backend":    h.Result.Backend,
+			"expires_at": h.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["version"].(int) < out[j]["version"].(int) })
+	return out
+}
+
+// PromoteHeld flips traffic to a held fork after the ready check passes.
+// Returns the retained source dir; the caller archives from it and then
+// removes it.
+func (p *Pool) PromoteHeld(version int, ready func(container, backend string) error) (string, *ForkResult, error) {
+	p.mu.Lock()
+	h, ok := p.held[version]
+	p.mu.Unlock()
+	if !ok {
+		return "", nil, fmt.Errorf("no held fork v%d (expired, promoted, or discarded?)", version)
+	}
+	if ready != nil {
+		if err := ready(h.Result.Container, h.Result.Backend); err != nil {
+			return "", nil, fmt.Errorf("held fork v%d not ready: %w", version, err)
+		}
+	}
+	p.Promote(h.Result)
+	p.mu.Lock()
+	delete(p.held, version)
+	p.mu.Unlock()
+	return h.SrcDir, h.Result, nil
+}
+
+// DiscardHeld destroys a held fork.
+func (p *Pool) DiscardHeld(version int) error {
+	p.mu.Lock()
+	h, ok := p.held[version]
+	if ok {
+		delete(p.held, version)
+	}
+	p.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no held fork v%d", version)
+	}
+	p.Discard(h.Result)
+	os.RemoveAll(h.SrcDir)
+	return nil
+}
+
+// StartHeldReaper discards held forks past their TTL.
+func (p *Pool) StartHeldReaper() {
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			p.mu.Lock()
+			var expired []int
+			for v, h := range p.held {
+				if time.Now().After(h.ExpiresAt) {
+					expired = append(expired, v)
+				}
+			}
+			p.mu.Unlock()
+			for _, v := range expired {
+				log.Printf("pool: held fork v%d expired, discarding", v)
+				p.DiscardHeld(v)
+			}
+		}
+	}()
 }
 
 // ShadowDir is where the last fork's patched source tree lives; the

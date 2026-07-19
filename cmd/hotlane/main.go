@@ -63,6 +63,12 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "push":
 		cmdPush(os.Args[2:])
+	case "test":
+		cmdTest(os.Args[2:])
+	case "promote":
+		cmdPromote(os.Args[2:])
+	case "discard":
+		cmdDiscard(os.Args[2:])
 	case "logs":
 		cmdLogs(os.Args[2:])
 	case "status":
@@ -86,6 +92,10 @@ commands:
   init      detect the app in the current directory and write hotlane.yml
   serve     run the daemon on this host
   push      send the current git delta to the daemon
+  test      like push, but HOLD the verified fork instead of promoting:
+            poke it via the X-Hotlane-Fork header, then promote/discard
+  promote   flip traffic to a held fork (hotlane promote <version>)
+  discard   destroy a held fork (hotlane discard <version>)
   status    show live version, ring, and last verify results
   rollback  flip the proxy to a previous version
   logs      tail the live version's output
@@ -171,6 +181,26 @@ func cmdServe(args []string) {
 
 	front := proxy.New()
 	front.Set(p.Backend)
+	p.StartHeldReaper()
+
+	// App traffic handler: live by default; the X-Hotlane-Fork header
+	// routes to a held (test-mode) fork. Unknown fork = explicit error,
+	// never a silent fall-through to live - an agent must not believe it
+	// tested a fork when it actually hit production.
+	appTraffic := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fv := r.Header.Get("X-Hotlane-Fork"); fv != "" {
+			n, err := strconv.Atoi(fv)
+			if err == nil {
+				if h := p.HeldProxy(n); h != nil {
+					h.ServeHTTP(w, r)
+					return
+				}
+			}
+			http.Error(w, "hotlane: no held fork "+fv+" (expired, promoted, or discarded?)", http.StatusMisdirectedRequest)
+			return
+		}
+		front.ServeHTTP(w, r)
+	})
 
 	notif := &notify.Notifier{URL: cfg.Notify, App: cfg.App}
 	arch := archive.New(cfg, p.DataDir, notif)
@@ -272,6 +302,11 @@ func cmdServe(args []string) {
 		rebaseDepth = v
 	}
 
+	holdTTL := 15 * time.Minute
+	if v, err := time.ParseDuration(os.Getenv("HOTLANE_HOLD_TTL")); err == nil && v > 0 {
+		holdTTL = v
+	}
+
 	// Pushes are serialized: forks share the shadow tree and the version
 	// counter, and one verified promote at a time is the contract.
 	var pushMu sync.Mutex
@@ -331,6 +366,107 @@ func cmdServe(args []string) {
 		json.NewEncoder(w).Encode(out)
 	})
 
+	// test: fork + verify, then HOLD instead of promote. The caller pokes
+	// the fork through the X-Hotlane-Fork header, then promotes/discards.
+	handle("POST /v1/test", func(w http.ResponseWriter, r *http.Request) {
+		diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		pushMu.Lock()
+		defer pushMu.Unlock()
+
+		base := ""
+		if arch.Drifted() {
+			base = arch.CleanImage()
+		} else if d, err := docker.LayerDepth(p.Live); err == nil && d >= rebaseDepth && docker.ImageExists(arch.CleanImage()) {
+			base = arch.CleanImage()
+		}
+		res, err := p.Fork(diff, base)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		out := pushResponse{ForkResult: res}
+		vStart := time.Now()
+		var ok bool
+		out.Verify, ok = verify.Run(cfg, res.Container, res.Backend)
+		out.VerifyMs = time.Since(vStart).Milliseconds()
+		out.TotalMs += out.VerifyMs
+		w.Header().Set("Content-Type", "application/json")
+		if !ok {
+			out.Logs = p.Discard(res)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+		if err := p.Hold(res, holdTTL); err != nil {
+			p.Discard(res)
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"fork":       out,
+			"held":       true,
+			"expires_in": holdTTL.String(),
+			"header":     fmt.Sprintf("X-Hotlane-Fork: %d", res.Version),
+		})
+	})
+	handle("POST /v1/promote", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Version int `json:"version"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ready := func(container, backend string) error {
+			results, ok := verify.Run(cfg, container, backend)
+			if ok {
+				return nil
+			}
+			for _, rr := range results {
+				if !rr.OK {
+					return fmt.Errorf("%s - %s", rr.Hook, rr.Detail)
+				}
+			}
+			return fmt.Errorf("verify failed")
+		}
+		pushMu.Lock()
+		defer pushMu.Unlock()
+		srcDir, res, err := p.PromoteHeld(req.Version, ready)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		front.Set(res.Backend)
+		if err := arch.Snapshot(srcDir); err != nil {
+			log.Printf("promote: archive snapshot: %v", err)
+		} else {
+			go arch.Archive(res.Version, res.Backend)
+		}
+		os.RemoveAll(srcDir)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
+	})
+	handle("POST /v1/discard", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Version int `json:"version"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		pushMu.Lock()
+		defer pushMu.Unlock()
+		if err := p.DiscardHeld(req.Version); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	// Auth wraps the whole API except the liveness probe. The app-traffic
 	// proxy is intentionally untouched - it serves the public app.
 	var api http.Handler = mux
@@ -351,7 +487,7 @@ func cmdServe(args []string) {
 
 	go func() {
 		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, front.Target())
-		log.Fatal(http.ListenAndServe(*proxyAddr, front))
+		log.Fatal(http.ListenAndServe(*proxyAddr, appTraffic))
 	}()
 
 	if *tlsDomain != "" {
@@ -370,7 +506,7 @@ func cmdServe(args []string) {
 				api.ServeHTTP(w, r)
 				return
 			}
-			front.ServeHTTP(w, r)
+			appTraffic.ServeHTTP(w, r)
 		})
 		srv := &http.Server{Addr: ":443", Handler: shared, TLSConfig: mgr.TLSConfig()}
 		go func() {
@@ -410,6 +546,32 @@ func cmdLogs(args []string) {
 	os.Stdout.Write(body)
 }
 
+// computeDiff builds the delta to send: from the daemon's baseline
+// commit (or an explicit ref) to the working tree.
+func computeDiff(daemon, from string) []byte {
+	base := from
+	if base == "" {
+		base = daemonBaseline(daemon)
+	}
+	diffArgs := []string{"diff", "HEAD", "--relative"}
+	if base != "" {
+		if exec.Command("git", "cat-file", "-e", base+"^{commit}").Run() != nil {
+			log.Fatalf("hotlane: baseline commit %.12s is not in this clone.\nCI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists.", base)
+		}
+		diffArgs = []string{"diff", base, "--relative"}
+	}
+	diffCmd := exec.Command("git", diffArgs...)
+	diffCmd.Stderr = os.Stderr
+	diff, err := diffCmd.Output()
+	if err != nil {
+		log.Fatalf("hotlane: git diff: %v", err)
+	}
+	if len(bytes.TrimSpace(diff)) == 0 {
+		log.Printf("hotlane: no changes vs the daemon's baseline; forking current state anyway")
+	}
+	return diff
+}
+
 // cmdPush sends the delta to the daemon. Two modes:
 //
 //   - dirty worktree (the local dev loop): git diff HEAD --relative, i.e.
@@ -423,31 +585,7 @@ func cmdPush(args []string) {
 	from := fs.String("from", "", "git ref to diff from (default: dirty worktree diffs HEAD, clean worktree diffs the daemon's baseline commit)")
 	fs.Parse(args)
 
-	// The daemon applies diffs against its pristine snapshot, so the diff
-	// base must be the baseline commit - git diff <base> covers committed
-	// AND uncommitted changes since then. HEAD is only a fallback for
-	// daemons that don't know their baseline (non-git source dir).
-	base := *from
-	if base == "" {
-		base = daemonBaseline(*daemon)
-	}
-	diffArgs := []string{"diff", "HEAD", "--relative"}
-	if base != "" {
-		if exec.Command("git", "cat-file", "-e", base+"^{commit}").Run() != nil {
-			log.Fatalf("hotlane push: baseline commit %.12s is not in this clone.\nCI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists.", base)
-		}
-		diffArgs = []string{"diff", base, "--relative"}
-	}
-
-	diffCmd := exec.Command("git", diffArgs...)
-	diffCmd.Stderr = os.Stderr
-	diff, err := diffCmd.Output()
-	if err != nil {
-		log.Fatalf("hotlane push: git diff: %v", err)
-	}
-	if len(bytes.TrimSpace(diff)) == 0 {
-		log.Printf("hotlane push: no changes vs the daemon's baseline; forking current state anyway")
-	}
+	diff := computeDiff(*daemon, *from)
 
 	resp, err := apiRequest("POST", *daemon+"/-/v1/push", "text/x-diff", bytes.NewReader(diff))
 	if err != nil {
@@ -486,6 +624,102 @@ func cmdPush(args []string) {
 		log.Fatalf("push REJECTED after %dms: fork destroyed, live version untouched", res.TotalMs)
 	}
 	fmt.Printf("PROMOTED v%d live in %dms\n", res.Version, res.TotalMs)
+}
+
+// cmdTest forks + verifies like push, but holds the fork for inspection
+// instead of promoting it.
+func cmdTest(args []string) {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	from := fs.String("from", "", "git ref to diff from (default: the daemon's baseline commit)")
+	fs.Parse(args)
+
+	diff := computeDiff(*daemon, *from)
+	resp, err := apiRequest("POST", *daemon+"/-/v1/test", "text/x-diff", bytes.NewReader(diff))
+	if err != nil {
+		log.Fatalf("hotlane test: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var out struct {
+		Fork      pushResponse `json:"fork"`
+		Held      bool         `json:"held"`
+		ExpiresIn string       `json:"expires_in"`
+		Header    string       `json:"header"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil || !out.Held {
+		var rej pushResponse
+		if json.Unmarshal(body, &rej) == nil && len(rej.Verify) > 0 {
+			for _, v := range rej.Verify {
+				mark := "ok  "
+				if !v.OK {
+					mark = "FAIL"
+				}
+				fmt.Printf("  %s %s (%dms)\n", mark, v.Hook, v.Ms)
+			}
+			if rej.Logs != "" {
+				fmt.Printf("--- fork logs ---\n%s\n", rej.Logs)
+			}
+			log.Fatalf("test REJECTED: fork destroyed, live version untouched")
+		}
+		log.Fatalf("hotlane test: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	r := out.Fork
+	fmt.Printf("fork %s (v%d): snapshot %dms | patch %dms | boot %dms | verify %dms\n",
+		r.Container, r.Version, r.SnapshotMs, r.PatchMs, r.BootMs, r.VerifyMs)
+	fmt.Printf("HELD v%d for %s - live traffic untouched\n", r.Version, out.ExpiresIn)
+	fmt.Printf("  poke it:    curl -H %q <your-app-url>/...\n", out.Header)
+	fmt.Printf("  ship it:    hotlane promote %d\n", r.Version)
+	fmt.Printf("  drop it:    hotlane discard %d\n", r.Version)
+}
+
+func cmdPromote(args []string) {
+	fs := flag.NewFlagSet("promote", flag.ExitOnError)
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		log.Fatal("usage: hotlane promote <version>")
+	}
+	v, err := strconv.Atoi(fs.Arg(0))
+	if err != nil {
+		log.Fatalf("hotlane promote: version must be a number, got %q", fs.Arg(0))
+	}
+	body, _ := json.Marshal(map[string]int{"version": v})
+	resp, err := apiRequest("POST", *daemon+"/-/v1/promote", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("hotlane promote: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("hotlane promote: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
+	}
+	fmt.Printf("PROMOTED v%d live - it is byte-identical to what you tested\n", v)
+}
+
+func cmdDiscard(args []string) {
+	fs := flag.NewFlagSet("discard", flag.ExitOnError)
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		log.Fatal("usage: hotlane discard <version>")
+	}
+	v, err := strconv.Atoi(fs.Arg(0))
+	if err != nil {
+		log.Fatalf("hotlane discard: version must be a number, got %q", fs.Arg(0))
+	}
+	body, _ := json.Marshal(map[string]int{"version": v})
+	resp, err := apiRequest("POST", *daemon+"/-/v1/discard", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("hotlane discard: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNoContent {
+		log.Fatalf("hotlane discard: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
+	}
+	fmt.Printf("discarded held fork v%d - live traffic never knew\n", v)
 }
 
 func cmdStatus(args []string) {

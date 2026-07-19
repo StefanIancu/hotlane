@@ -81,34 +81,56 @@ OUT="$("$BIN" push)" || fail "CI-mode push rejected: $OUT"
 echo "$OUT" | grep -q "PROMOTED v3" || fail "no PROMOTED v3 in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v3"
 
+step "test: hold a fork, poke it via header, live untouched, then promote"
+perl -pi -e 's/"v3"/"v3t"/' server.js
+OUT="$("$BIN" test)" || fail "test rejected: $OUT"
+HV=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
+[ -n "$HV" ] || fail "no HELD version in: $OUT"
+expect_body "http://$PROXY/" "hello from demo-app v3"
+FORK_BODY=$(curl -s -H "X-Hotlane-Fork: $HV" "http://$PROXY/")
+[ "$FORK_BODY" = "hello from demo-app v3t" ] || fail "fork body wrong: $FORK_BODY"
+"$BIN" promote "$HV" | grep -q "PROMOTED" || fail "promote of held fork failed"
+expect_body "http://$PROXY/" "hello from demo-app v3t"
+curl -s -H "X-Hotlane-Fork: $HV" "http://$PROXY/" | grep -q "no held fork" || fail "promoted fork still routable as held"
+
+step "test: discard a held fork, nothing changes"
+perl -pi -e 's/"v3t"/"v3x"/' server.js
+OUT="$("$BIN" test)" || fail "second test rejected: $OUT"
+HV2=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
+"$BIN" discard "$HV2" | grep -q "discarded" || fail "discard failed"
+expect_body "http://$PROXY/" "hello from demo-app v3t"
+perl -pi -e 's/"v3x"/"v3t"/' server.js
+
 step "push: broken change is rejected, live untouched"
 perl -pi -e 's/writeHead\(200/writeHead(500/g' server.js
 if OUT="$("$BIN" push 2>&1)"; then fail "broken push was promoted: $OUT"; fi
 echo "$OUT" | grep -q "REJECTED" || fail "no REJECTED in: $OUT"
-expect_body "http://$PROXY/" "hello from demo-app v3"
+expect_body "http://$PROXY/" "hello from demo-app v3t"
 git checkout -q server.js
+perl -pi -e 's/"v3"/"v3t"/' server.js
 
 step "rollback: previous version, then forward"
-"$BIN" rollback | grep -q "ROLLED BACK to v2" || fail "rollback to v2 failed"
-expect_body "http://$PROXY/" "hello from demo-app v2"
-"$BIN" rollback 3 >/dev/null || fail "rollback 3 failed"
+"$BIN" rollback | grep -q "ROLLED BACK to v3" || fail "rollback to v3 failed"
 expect_body "http://$PROXY/" "hello from demo-app v3"
+"$BIN" rollback 4 >/dev/null || fail "rollback 4 failed"
+expect_body "http://$PROXY/" "hello from demo-app v3t"
 
-step "archivist: clean build catches up to v3"
-wait_archive 3 || fail "archive never reached v3/clean (overlap-collapse regression?)"
+step "archivist: clean build catches up to the promoted held fork (v4)"
+wait_archive 4 || fail "archive never reached v4/clean (overlap-collapse regression?)"
 
 step "drift: tampering the live container is detected"
-docker exec hotlane-demo-v3 sh -c 'echo TAMPERED > /app/message.txt'
+docker exec hotlane-demo-v4 sh -c 'echo TAMPERED > /app/message.txt'
 if "$BIN" drift >/dev/null 2>&1; then fail "drift not detected"; fi
 
 step "drift: recovery push forks from the clean image and heals"
-# note: the REJECTED push above consumed v4 - version numbers are honest
-# history and never reused, so the recovery promotes as v5.
-perl -pi -e 's/"v3"/"v4"/' server.js
+# version bookkeeping: v2,v3 pushes; v4 promoted-held; v5 discarded-held;
+# the REJECTED push consumed v6 - so recovery promotes as v7. Version
+# numbers are honest history and never reused.
+perl -pi -e 's/"v3t"/"v4"/' server.js
 OUT="$("$BIN" push)" || fail "recovery push rejected: $OUT"
-echo "$OUT" | grep -q "PROMOTED v5" || fail "no PROMOTED v5 in: $OUT"
+echo "$OUT" | grep -q "PROMOTED v7" || fail "no PROMOTED v7 in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v4"
-wait_archive 5 || fail "archive never reached v5/clean after recovery"
+wait_archive 7 || fail "archive never reached v7/clean after recovery"
 "$BIN" drift | grep -q "CLEAN" || fail "drift not clean after recovery"
 
 step "auth: daemon restart adopts the live container, token gates the API"
@@ -121,7 +143,7 @@ HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -pro
 wait_http "http://$PROXY/" 200 30 || fail "adopt after restart failed"
 expect_body "http://$PROXY/" "hello from demo-app v4"
 if "$BIN" status >/dev/null 2>&1; then fail "API served without token"; fi
-HOTLANE_TOKEN=supersecret "$BIN" status | grep -q "live: v5" || fail "authorized status failed"
+HOTLANE_TOKEN=supersecret "$BIN" status | grep -q "live: v7" || fail "authorized status failed"
 wait_http "http://$API/healthz" 200 5 || fail "healthz should stay open without token"
 
 printf '\nALL E2E CHECKS PASSED\n'

@@ -104,6 +104,10 @@ notify: https://hooks.slack.com/services/...  # drift detected/healed, push reje
 hotlane init         # detect the app, write a starter hotlane.yml
 hotlane serve        # run the daemon (-token / -tls-domain for a safely exposed API)
 hotlane push         # git delta -> verified running fork -> traffic flip (~1-2s)
+hotlane test         # like push, but HOLD the verified fork: poke it via the
+                     #   X-Hotlane-Fork header, then promote or discard it
+hotlane promote <n>  # flip traffic to a held fork - byte-identical to what you tested
+hotlane discard <n>  # destroy a held fork; live traffic never knew
 hotlane rollback [n] # flip to the previous (or a specific) kept version
 hotlane status       # live version, ring, drift verdict, timings
 hotlane logs [-n N]  # tail the live version's output
@@ -126,7 +130,7 @@ Divergence pings your webhook (Slack/Discord native), and the next ordinary push
 
 ## Built for agent loops
 
-An agent can't wait eight minutes to learn it was wrong. hotlane makes each push-observe-fix turn cost about a second, over one HTTP endpoint (POST a raw git diff, get JSON back: timings, hook verdicts, promoted or rejected with logs), with the verify gate as the guardrail - a bad agent push dies in isolation while production keeps serving. Agents can learn the whole tool from [hotlane.dev/llms.txt](https://hotlane.dev/llms.txt).
+An agent can't wait eight minutes to learn it was wrong. hotlane makes each push-observe-fix turn cost about a second, over one HTTP endpoint (POST a raw git diff, get JSON back: timings, hook verdicts, promoted or rejected with logs), with the verify gate as the guardrail - a bad agent push dies in isolation while production keeps serving. And with `hotlane test`, the agent's own task-specific checks join the gate: fork, poke the running result through the `X-Hotlane-Fork` header while users stay on live, then promote the exact instance it validated - no rebuild between tested and live. Agents can learn the whole tool from [hotlane.dev/llms.txt](https://hotlane.dev/llms.txt).
 
 ## Where it runs (and doesn't)
 
