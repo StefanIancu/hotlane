@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -51,8 +52,10 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "push":
 		cmdPush(os.Args[2:])
-	case "status", "rollback":
-		log.Fatalf("hotlane %s: not implemented yet (see docs/mvp.md milestones)", os.Args[1])
+	case "status":
+		cmdStatus(os.Args[2:])
+	case "rollback":
+		cmdRollback(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("hotlane", version)
 	default:
@@ -112,7 +115,27 @@ func cmdServe(args []string) {
 			"version":   p.Version,
 			"backend":   front.Target(),
 			"last_fork": p.LastFork,
+			"ring":      p.Ring(),
 		})
+	})
+	mux.HandleFunc("POST /v1/rollback", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Version int `json:"version"`
+		}
+		if r.ContentLength > 0 {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		res, err := p.Rollback(req.Version)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		front.Set(res.Backend)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
 	})
 	// Pushes are serialized: forks share the shadow tree and the version
 	// counter, and one verified promote at a time is the contract.
@@ -208,4 +231,88 @@ func cmdPush(args []string) {
 		log.Fatalf("push REJECTED after %dms: fork destroyed, live version untouched", res.TotalMs)
 	}
 	fmt.Printf("PROMOTED v%d live in %dms\n", res.Version, res.TotalMs)
+}
+
+func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	fs.Parse(args)
+
+	var st struct {
+		App      string           `json:"app"`
+		Live     string           `json:"live"`
+		Version  int              `json:"version"`
+		Backend  string           `json:"backend"`
+		Ring     []pool.RingEntry `json:"ring"`
+		LastFork *pool.ForkResult `json:"last_fork"`
+	}
+	getJSON(*daemon+"/v1/status", &st)
+	fmt.Printf("app:  %s\n", st.App)
+	fmt.Printf("live: v%d (%s) -> %s\n", st.Version, st.Live, st.Backend)
+	fmt.Println("ring:")
+	for _, e := range st.Ring {
+		mark := " "
+		if e.Live {
+			mark = "*"
+		}
+		fmt.Printf("  %s v%-3d %-24s %s\n", mark, e.Version, e.Container, e.Status)
+	}
+	if st.LastFork != nil {
+		fmt.Printf("last fork: v%d (snapshot %dms | patch %dms | boot %dms | total %dms)\n",
+			st.LastFork.Version, st.LastFork.SnapshotMs, st.LastFork.PatchMs,
+			st.LastFork.BootMs, st.LastFork.TotalMs)
+	}
+}
+
+// cmdRollback flips traffic to a previous version: `hotlane rollback` for
+// the one before live, `hotlane rollback 3` for v3 specifically.
+func cmdRollback(args []string) {
+	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	fs.Parse(args)
+
+	req := struct {
+		Version int `json:"version"`
+	}{}
+	if fs.NArg() > 0 {
+		v, err := strconv.Atoi(fs.Arg(0))
+		if err != nil {
+			log.Fatalf("hotlane rollback: version must be a number, got %q", fs.Arg(0))
+		}
+		req.Version = v
+	}
+	body, _ := json.Marshal(req)
+	resp, err := http.Post(*daemon+"/v1/rollback", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("hotlane rollback: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("hotlane rollback: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
+	}
+	var res pool.RollbackResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		log.Fatalf("hotlane rollback: bad response: %v", err)
+	}
+	how := "was still running"
+	if res.Restarted {
+		how = "restarted from ring"
+	}
+	fmt.Printf("ROLLED BACK to v%d (%s, %s) in %dms\n", res.Version, res.Container, how, res.TotalMs)
+}
+
+func getJSON(url string, v any) {
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Fatalf("hotlane: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("hotlane: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		log.Fatalf("hotlane: bad response: %v", err)
+	}
 }

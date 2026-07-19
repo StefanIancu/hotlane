@@ -41,6 +41,26 @@ func Running(app string) ([]string, error) {
 	return names, nil
 }
 
+// ContainerInfo is one hotlane container in any state.
+type ContainerInfo struct {
+	Name   string
+	Status string // docker's human status, e.g. "Up 5 minutes", "Exited (137) ..."
+}
+
+// All returns hotlane containers for app in any state.
+func All(app string) ([]ContainerInfo, error) {
+	out, err := run("ps", "-a", "--filter", "label="+LabelApp+"="+app, "--format", "{{.Names}}\t{{.Status}}")
+	if err != nil || out == "" {
+		return nil, err
+	}
+	var infos []ContainerInfo
+	for _, line := range strings.Split(out, "\n") {
+		name, status, _ := strings.Cut(line, "\t")
+		infos = append(infos, ContainerInfo{Name: name, Status: status})
+	}
+	return infos, nil
+}
+
 // Commit snapshots a container's filesystem into an image. Running
 // containers are paused briefly; this is what makes forks inherit the warm
 // state (dependencies, build caches) for free.
@@ -94,6 +114,12 @@ func Start(name string) error {
 func Stop(name string, graceSecs int) error {
 	_, err := run("stop", "-t", strconv.Itoa(graceSecs), name)
 	return err
+}
+
+// Kill force-kills a container immediately (best effort; it may already
+// have exited).
+func Kill(name string) {
+	run("kill", name)
 }
 
 // Exec runs a shell command inside a running container and returns its

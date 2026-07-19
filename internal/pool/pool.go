@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,8 +28,9 @@ type Pool struct {
 	Src     string // app source directory (where hotlane.yml lives)
 	DataDir string // daemon state: pristine + shadow source copies
 
-	mu   sync.Mutex
-	next int // next version number to assign
+	mu       sync.Mutex
+	next     int      // next version number to assign
+	stopping sync.Map // container name -> chan struct{}, closed when its stop completes
 
 	Live     string // live container name
 	Backend  string // loopback host:port the proxy targets
@@ -221,21 +224,187 @@ func (p *Pool) Fork(diff []byte) (*ForkResult, error) {
 
 // Promote makes a verified fork the live version. The previous live
 // container is stopped in the background (it keeps its filesystem and
-// becomes a ring entry) so the flip itself costs nothing.
+// becomes a ring entry) so the flip itself costs nothing; the ring is
+// pruned to size afterwards.
 func (p *Pool) Promote(res *ForkResult) (old string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	old = p.Live
 	p.Live, p.Backend, p.Version = res.Container, res.Backend, res.Version
 	if old != "" && old != res.Container {
-		go func() {
-			if err := docker.Stop(old, 5); err != nil {
-				log.Printf("pool: stopping superseded %s: %v", old, err)
-			}
-		}()
+		p.stopAsync(old, p.prune)
 	}
 	log.Printf("pool: promoted %s (v%d), superseded %s", res.Container, res.Version, old)
 	return old
+}
+
+// stopAsync stops a superseded container in the background so flips stay
+// instant, and records the in-flight stop: anything that wants to bring
+// that container back (rollback) must wait for the stop to land first, or
+// the delayed SIGKILL murders the freshly re-promoted live version.
+func (p *Pool) stopAsync(name string, after func()) {
+	ch := make(chan struct{})
+	p.stopping.Store(name, ch)
+	go func() {
+		if err := docker.Stop(name, 5); err != nil {
+			log.Printf("pool: stopping superseded %s: %v", name, err)
+		}
+		p.stopping.Delete(name)
+		close(ch)
+		if after != nil {
+			after()
+		}
+	}()
+}
+
+// waitStopped blocks until any in-flight stop of name has completed.
+// The pending stop is hastened with a kill: the caller wants this
+// container back right now and is about to restart it anyway, so waiting
+// out a SIGTERM grace period buys nothing.
+func (p *Pool) waitStopped(name string) {
+	if ch, ok := p.stopping.Load(name); ok {
+		docker.Kill(name)
+		<-ch.(chan struct{})
+	}
+}
+
+// RingEntry is one kept version.
+type RingEntry struct {
+	Version   int    `json:"version"`
+	Container string `json:"container"`
+	Status    string `json:"status"`
+	Live      bool   `json:"live"`
+}
+
+// Ring lists all kept versions, newest first, live included.
+func (p *Pool) Ring() []RingEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ring()
+}
+
+// ring is Ring without locking, for callers already holding p.mu.
+func (p *Pool) ring() []RingEntry {
+	infos, err := docker.All(p.Cfg.App)
+	if err != nil {
+		log.Printf("pool: listing ring: %v", err)
+	}
+	entries := make([]RingEntry, 0, len(infos))
+	for _, in := range infos {
+		v := versionFromName(in.Name)
+		if v == 0 {
+			continue
+		}
+		entries = append(entries, RingEntry{
+			Version:   v,
+			Container: in.Name,
+			Status:    in.Status,
+			Live:      in.Name == p.Live,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Version > entries[j].Version })
+	return entries
+}
+
+func versionFromName(name string) int {
+	i := strings.LastIndex(name, "-v")
+	if i < 0 {
+		return 0
+	}
+	v, _ := strconv.Atoi(name[i+2:])
+	return v
+}
+
+// prune removes the oldest non-live versions beyond the configured ring
+// size, containers and snapshot images both (unbounded version stacking is
+// how hosts run out of disk).
+func (p *Pool) prune() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := 0
+	for _, e := range p.ring() {
+		if e.Live {
+			continue
+		}
+		if kept < p.Cfg.Ring {
+			kept++
+			continue
+		}
+		log.Printf("pool: pruning %s (ring=%d)", e.Container, p.Cfg.Ring)
+		if err := docker.Remove(e.Container); err != nil {
+			log.Printf("pool: pruning %s: %v", e.Container, err)
+			continue
+		}
+		// Best effort: v1 has no snapshot image (baseline runs on cfg.Image).
+		docker.RemoveImage(p.imageRef(e.Version))
+	}
+}
+
+// RollbackResult describes a completed rollback.
+type RollbackResult struct {
+	Container string `json:"container"`
+	Backend   string `json:"backend"`
+	Version   int    `json:"version"`
+	Restarted bool   `json:"restarted"`
+	TotalMs   int64  `json:"total_ms"`
+}
+
+// Rollback flips traffic to a kept version; version 0 means the newest
+// ring entry older than live. A stopped entry is started first (its boot
+// command reruns against its own warm filesystem).
+func (p *Pool) Rollback(version int) (*RollbackResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	start := time.Now()
+
+	var target *RingEntry
+	for _, e := range p.ring() {
+		e := e
+		if version == 0 && !e.Live && e.Version < p.Version {
+			target = &e
+			break // ring is newest-first: first older entry is the previous version
+		}
+		if version != 0 && e.Version == version {
+			target = &e
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("no ring entry to roll back to (want v%d)", version)
+	}
+	if target.Live {
+		return nil, fmt.Errorf("v%d is already live", target.Version)
+	}
+
+	res := &RollbackResult{Container: target.Container, Version: target.Version}
+	// If the target was just superseded its stop may still be in flight;
+	// let it land so we restart cleanly instead of adopting a dying
+	// container. Blocks the pool for at most the stop grace period.
+	p.waitStopped(target.Container)
+	if !docker.IsRunning(target.Container) {
+		res.Restarted = true
+		if err := docker.Start(target.Container); err != nil {
+			return nil, err
+		}
+	}
+	addr, err := docker.HostAddr(target.Container, p.Cfg.Port)
+	if err != nil {
+		return nil, err
+	}
+	if err := waitReady(addr, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("rollback %s: %w", target.Container, err)
+	}
+
+	old := p.Live
+	p.Live, p.Backend, p.Version = target.Container, addr, target.Version
+	if old != "" {
+		p.stopAsync(old, nil)
+	}
+	res.Backend = addr
+	res.TotalMs = time.Since(start).Milliseconds()
+	log.Printf("pool: rolled back to %s (v%d) at %s in %dms (restarted=%v)",
+		target.Container, target.Version, addr, res.TotalMs, res.Restarted)
+	return res, nil
 }
 
 // Discard destroys a failed fork (container and snapshot image - failed
