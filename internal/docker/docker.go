@@ -28,16 +28,27 @@ func run(args ...string) (string, error) {
 	return s, nil
 }
 
-// Running returns the names of running hotlane containers for app, oldest
-// version first. Until promote lands (M3) the live instance is always the
-// lowest running version: forks boot at higher versions and stay side-lined.
+// Running returns the names of running hotlane containers for app, newest
+// version first (numeric on the -v<N> suffix - lexical sort misorders v10
+// vs v9). The newest running version is the authoritative live one: promote
+// starts stopping its predecessor immediately, so a lower version still
+// running is only mid-grace on its way down - adopting it means adopting a
+// container that is about to die.
 func Running(app string) ([]string, error) {
 	out, err := run("ps", "--filter", "label="+LabelApp+"="+app, "--format", "{{.Names}}")
 	if err != nil || out == "" {
 		return nil, err
 	}
 	names := strings.Split(out, "\n")
-	sort.Strings(names)
+	ver := func(name string) int {
+		i := strings.LastIndex(name, "-v")
+		if i < 0 {
+			return 0
+		}
+		v, _ := strconv.Atoi(name[i+2:])
+		return v
+	}
+	sort.Slice(names, func(i, j int) bool { return ver(names[i]) > ver(names[j]) })
 	return names, nil
 }
 

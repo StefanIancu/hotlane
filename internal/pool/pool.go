@@ -86,6 +86,9 @@ func (p *Pool) Ensure() error {
 		return err
 	}
 	if len(running) > 0 {
+		// Newest running version: a daemon restart can land inside the
+		// previous version's stop grace, when both old and new are
+		// briefly running - the newest is the one promote made live.
 		return p.adopt(running[0])
 	}
 	return p.createBaseline()
