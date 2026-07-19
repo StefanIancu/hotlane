@@ -88,7 +88,9 @@
   <p>One binary, one config file, one daemon per host. Everything below is the full surface.</p>
 
   <h2 id="quickstart">Quickstart</h2>
-  <pre><code><span class="c"># in your app's repo (Node, Python, or Go)</span>
+  <pre><code>npm install -g hotlane        <span class="c"># or: pip install hotlane</span>
+
+<span class="c"># in your app's repo (Node, Python, or Go)</span>
 hotlane init          <span class="c"># detects the app, writes hotlane.yml - review it</span>
 hotlane serve         <span class="c"># boots the warm baseline, proxies traffic on :7480</span>
 

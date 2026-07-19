@@ -4,7 +4,9 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const { version } = require("./package.json");
+// The daemon/CLI release this wrapper fetches. Deliberately decoupled from
+// the package version so wrapper-only fixes don't require binary releases.
+const BINARY_VERSION = "0.1.0";
 
 const OS = { darwin: "darwin", linux: "linux" }[process.platform];
 const ARCH = { x64: "amd64", arm64: "arm64" }[process.arch];
@@ -15,7 +17,7 @@ if (!OS || !ARCH) {
   process.exit(1);
 }
 
-const url = `https://github.com/StefanIancu/hotlane/releases/download/v${version}/hotlane_${OS}_${ARCH}.tar.gz`;
+const url = `https://github.com/StefanIancu/hotlane/releases/download/v${BINARY_VERSION}/hotlane_${OS}_${ARCH}.tar.gz`;
 const dir = path.join(__dirname, "bin");
 const tarball = path.join(dir, "hotlane.tar.gz");
 
@@ -31,7 +33,7 @@ fetch(url)
     execFileSync("tar", ["-xzf", tarball, "-C", dir, "hotlane"]);
     fs.unlinkSync(tarball);
     fs.chmodSync(path.join(dir, "hotlane"), 0o755);
-    console.log(`hotlane ${version} installed (${OS}/${ARCH})`);
+    console.log(`hotlane ${BINARY_VERSION} installed (${OS}/${ARCH})`);
   })
   .catch((err) => {
     console.error(`hotlane: failed to download binary: ${err.message}`);
