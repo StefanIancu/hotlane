@@ -4,4 +4,5 @@ run: node server.js
 port: 3000
 verify:
   - http: /health == 200
+  - http: / == 200
 ring: 3

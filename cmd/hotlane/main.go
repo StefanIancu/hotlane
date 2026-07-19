@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/proxy"
@@ -56,6 +57,8 @@ func main() {
 		cmdStatus(os.Args[2:])
 	case "rollback":
 		cmdRollback(os.Args[2:])
+	case "drift":
+		cmdDrift(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("hotlane", version)
 	default:
@@ -72,6 +75,7 @@ commands:
   push      send the current git delta to the daemon
   status    show live version, ring, and last verify results
   rollback  flip the proxy to a previous version
+  drift     cold-boot the clean image and diff its behavior against live
   version   print version`)
 }
 
@@ -103,6 +107,21 @@ func cmdServe(args []string) {
 	front := proxy.New()
 	front.Set(p.Backend)
 
+	arch := archive.New(cfg, p.DataDir)
+	// Archive the starting state so a clean image exists from day one; on
+	// adopt this is the working tree, which matches the baseline contract
+	// (serve starts from a clean checkout).
+	if err := arch.Snapshot(src); err != nil {
+		log.Printf("hotlane: archive snapshot: %v", err)
+	} else {
+		go arch.Archive(p.Version, p.Backend)
+	}
+	go func() {
+		for range time.Tick(6 * time.Hour) {
+			arch.DriftCheck(p.Backend)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
@@ -116,7 +135,13 @@ func cmdServe(args []string) {
 			"backend":   front.Target(),
 			"last_fork": p.LastFork,
 			"ring":      p.Ring(),
+			"archive":   arch.Status(),
 		})
+	})
+	mux.HandleFunc("POST /v1/drift-check", func(w http.ResponseWriter, r *http.Request) {
+		st := arch.DriftCheck(p.Backend)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(st)
 	})
 	mux.HandleFunc("POST /v1/rollback", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -149,7 +174,13 @@ func cmdServe(args []string) {
 		pushMu.Lock()
 		defer pushMu.Unlock()
 
-		res, err := p.Fork(diff)
+		// Drift recovery: while the app is flagged drifted, forks build
+		// from the clean image instead of the warm chain.
+		base := ""
+		if arch.Drifted() {
+			base = arch.CleanImage()
+		}
+		res, err := p.Fork(diff, base)
 		if err != nil {
 			log.Printf("push: %v", err)
 			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
@@ -171,6 +202,11 @@ func cmdServe(args []string) {
 		}
 		p.Promote(res)
 		front.Set(res.Backend)
+		if err := arch.Snapshot(p.ShadowDir()); err != nil {
+			log.Printf("push: archive snapshot: %v", err)
+		} else {
+			go arch.Archive(res.Version, res.Backend)
+		}
 		json.NewEncoder(w).Encode(out)
 	})
 
@@ -245,6 +281,7 @@ func cmdStatus(args []string) {
 		Backend  string           `json:"backend"`
 		Ring     []pool.RingEntry `json:"ring"`
 		LastFork *pool.ForkResult `json:"last_fork"`
+		Archive  archive.Status   `json:"archive"`
 	}
 	getJSON(*daemon+"/v1/status", &st)
 	fmt.Printf("app:  %s\n", st.App)
@@ -262,6 +299,39 @@ func cmdStatus(args []string) {
 			st.LastFork.Version, st.LastFork.SnapshotMs, st.LastFork.PatchMs,
 			st.LastFork.BootMs, st.LastFork.TotalMs)
 	}
+	drift := st.Archive.Drift
+	if st.Archive.Building {
+		drift += " (clean build in progress)"
+	}
+	fmt.Printf("archive: %s v%d, drift %s", st.Archive.Image, st.Archive.LastVersion, drift)
+	if st.Archive.Detail != "" {
+		fmt.Printf(" - %s", st.Archive.Detail)
+	}
+	fmt.Println()
+}
+
+// cmdDrift asks the daemon to cold-boot the clean image and diff its
+// behavior against live, right now.
+func cmdDrift(args []string) {
+	fs := flag.NewFlagSet("drift", flag.ExitOnError)
+	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	fs.Parse(args)
+
+	resp, err := http.Post(*daemon+"/v1/drift-check", "application/json", nil)
+	if err != nil {
+		log.Fatalf("hotlane drift: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var st archive.Status
+	if err := json.Unmarshal(body, &st); err != nil {
+		log.Fatalf("hotlane drift: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	if st.Drift == archive.DriftClean {
+		fmt.Printf("CLEAN: cold boot of %s behaves like live (checked %s)\n", st.Image, st.CheckedAt)
+		return
+	}
+	log.Fatalf("DRIFTED: %s\nnext push will rebuild from %s", st.Detail, st.Image)
 }
 
 // cmdRollback flips traffic to a previous version: `hotlane rollback` for

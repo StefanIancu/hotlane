@@ -151,6 +151,26 @@ func RemoveImage(imageRef string) error {
 	return err
 }
 
+// Build builds an image from a context directory (expects a Dockerfile
+// inside it). Clean builds are minutes-class by design - they run off the
+// critical path.
+func Build(dir, tag string) error {
+	_, err := run("build", "-t", tag, dir)
+	return err
+}
+
+// TagImage adds a tag to an existing image.
+func TagImage(src, dst string) error {
+	_, err := run("tag", src, dst)
+	return err
+}
+
+// Push pushes an image ref to its registry (requires prior docker login).
+func Push(ref string) error {
+	_, err := run("push", ref)
+	return err
+}
+
 // Remove force-removes a container.
 func Remove(name string) error {
 	_, err := run("rm", "-f", name)

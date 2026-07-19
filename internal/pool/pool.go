@@ -44,6 +44,7 @@ type ForkResult struct {
 	Container  string `json:"container"`
 	Backend    string `json:"backend"`
 	Version    int    `json:"version"`
+	FromClean  bool   `json:"from_clean,omitempty"` // forked from the archivist's clean image, not the live chain
 	SnapshotMs int64  `json:"snapshot_ms"`
 	PatchMs    int64  `json:"patch_ms"`
 	BootMs     int64  `json:"boot_ms"`
@@ -149,7 +150,12 @@ func (p *Pool) createBaseline() error {
 // the result on its own loopback port. The diff is cumulative against the
 // source tree as it was when the baseline was created (a working-tree
 // `git diff HEAD` from a clean checkout matches that contract).
-func (p *Pool) Fork(diff []byte) (*ForkResult, error) {
+//
+// A non-empty baseImage overrides the warm snapshot: the fork builds from
+// that image instead of committing the live container. This is the drift
+// recovery path - forking from the archivist's clean image resets the
+// warm chain to a known-good state.
+func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.Live == "" {
@@ -162,9 +168,13 @@ func (p *Pool) Fork(diff []byte) (*ForkResult, error) {
 	res.Container = name
 
 	// Snapshot: the fork's image is the live container's filesystem, warm
-	// caches included.
+	// caches included - unless a clean base was requested.
 	imageRef := p.imageRef(res.Version)
-	if err := docker.Commit(p.Live, imageRef); err != nil {
+	if baseImage != "" {
+		imageRef = baseImage
+		res.FromClean = true
+		log.Printf("pool: forking v%d from clean image %s (drift recovery)", res.Version, baseImage)
+	} else if err := docker.Commit(p.Live, imageRef); err != nil {
 		return nil, err
 	}
 	res.SnapshotMs = time.Since(start).Milliseconds()
@@ -437,9 +447,13 @@ func (p *Pool) ensurePristine() error {
 	return copyTree(p.Src, p.pristineDir())
 }
 
+// ShadowDir is where the last fork's patched source tree lives; the
+// archivist snapshots it at promote time.
+func (p *Pool) ShadowDir() string { return filepath.Join(p.DataDir, "shadow") }
+
 // resetShadow rebuilds the shadow tree from pristine and returns its path.
 func (p *Pool) resetShadow() (string, error) {
-	shadow := filepath.Join(p.DataDir, "shadow")
+	shadow := p.ShadowDir()
 	if err := os.RemoveAll(shadow); err != nil {
 		return "", err
 	}
