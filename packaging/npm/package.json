@@ -1,6 +1,6 @@
 {
   "name": "hotlane",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer.",
   "license": "MIT",
   "author": "Stefan Iancu",
