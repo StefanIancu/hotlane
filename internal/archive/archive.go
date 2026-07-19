@@ -48,8 +48,10 @@ type Archivist struct {
 	DataDir  string
 	Notifier *notify.Notifier
 
-	mu     sync.Mutex
-	status Status
+	mu             sync.Mutex
+	status         Status
+	pendingVersion int    // a promote arrived mid-build; run again for this version
+	pendingBackend string // ...against this live backend
 }
 
 func New(cfg *config.Config, dataDir string, n *notify.Notifier) *Archivist {
@@ -93,43 +95,57 @@ func (a *Archivist) Snapshot(src string) error {
 
 // Archive builds the clean image from the last snapshot, pushes it to the
 // configured registry if any, and runs a drift check against the live
-// backend. Meant to be called in a goroutine after promote; overlapping
-// calls collapse (the newest snapshot wins the next run).
+// backend. Meant to be called in a goroutine after promote. Overlapping
+// calls collapse: a promote landing mid-build queues exactly one follow-up
+// run for the newest version - dropped runs would leave a stale clean
+// image and false-positive drift verdicts under rapid pushes.
 func (a *Archivist) Archive(version int, liveBackend string) {
 	a.mu.Lock()
 	if a.status.Building {
+		a.pendingVersion, a.pendingBackend = version, liveBackend
 		a.mu.Unlock()
 		return
 	}
 	a.status.Building = true
 	a.mu.Unlock()
 
-	err := a.build()
-	a.mu.Lock()
-	a.status.Building = false
-	if err != nil {
-		a.status.Detail = "clean build failed: " + err.Error()
+	for {
+		if err := a.build(); err != nil {
+			a.mu.Lock()
+			a.status.Detail = "clean build failed: " + err.Error()
+			a.mu.Unlock()
+			log.Printf("archive: %v", err)
+			a.Notifier.Send(notify.EventCleanBuildFailed, err.Error())
+		} else {
+			a.mu.Lock()
+			a.status.LastVersion = version
+			a.mu.Unlock()
+			log.Printf("archive: clean image %s built for v%d", a.CleanImage(), version)
+
+			if a.Cfg.Archive != "" {
+				ref := fmt.Sprintf("%s:v%d", a.Cfg.Archive, version)
+				if err := docker.TagImage(a.CleanImage(), ref); err == nil {
+					if err := docker.Push(ref); err != nil {
+						log.Printf("archive: pushing %s: %v (is docker logged in?)", ref, err)
+					} else {
+						log.Printf("archive: pushed %s", ref)
+					}
+				}
+			}
+			a.DriftCheck(liveBackend)
+		}
+
+		a.mu.Lock()
+		if a.pendingVersion != 0 {
+			version, liveBackend = a.pendingVersion, a.pendingBackend
+			a.pendingVersion = 0
+			a.mu.Unlock()
+			continue
+		}
+		a.status.Building = false
 		a.mu.Unlock()
-		log.Printf("archive: %v", err)
-		a.Notifier.Send(notify.EventCleanBuildFailed, err.Error())
 		return
 	}
-	a.status.LastVersion = version
-	a.mu.Unlock()
-	log.Printf("archive: clean image %s built for v%d", a.CleanImage(), version)
-
-	if a.Cfg.Archive != "" {
-		ref := fmt.Sprintf("%s:v%d", a.Cfg.Archive, version)
-		if err := docker.TagImage(a.CleanImage(), ref); err == nil {
-			if err := docker.Push(ref); err != nil {
-				log.Printf("archive: pushing %s: %v (is docker logged in?)", ref, err)
-			} else {
-				log.Printf("archive: pushed %s", ref)
-			}
-		}
-	}
-
-	a.DriftCheck(liveBackend)
 }
 
 // build generates a Dockerfile from hotlane.yml and does the cold build.
