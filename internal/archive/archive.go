@@ -303,11 +303,11 @@ var volatile = []struct {
 	re   *regexp.Regexp
 	repl string
 }{
-	{regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?`), "<ts>"}, // ISO 8601
+	{regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?`), "<ts>"},                                                // ISO 8601
 	{regexp.MustCompile(`(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT`), "<ts>"}, // RFC 1123
 	{regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), "<uuid>"},
-	{regexp.MustCompile(`\b[0-9a-fA-F]{16,64}\b`), "<hex>"},   // request ids, hashes
-	{regexp.MustCompile(`\b\d{10,19}\b`), "<num>"},            // unix seconds/millis, counters
+	{regexp.MustCompile(`\b[0-9a-fA-F]{16,64}\b`), "<hex>"}, // request ids, hashes
+	{regexp.MustCompile(`\b\d{10,19}\b`), "<num>"},          // unix seconds/millis, counters
 }
 
 // normalize masks volatile content so it never reads as drift.
