@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/docker"
 	"github.com/StefanIancu/hotlane/internal/notify"
+	"github.com/StefanIancu/hotlane/internal/respdiff"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
 
@@ -298,32 +298,10 @@ func compareResponses(cfg *config.Config, coldAddr, liveAddr string) string {
 		}
 		if cold.body != live.body {
 			return fmt.Sprintf("behavior differs on %s: clean build serves %q, live serves %q",
-				path, truncate(cold.body, 120), truncate(live.body, 120))
+				path, respdiff.Truncate(cold.body, 120), respdiff.Truncate(live.body, 120))
 		}
 	}
 	return ""
-}
-
-// volatile are content patterns that legitimately vary between two builds
-// of the same source: masked before bodies are compared. Order matters -
-// timestamps go before the bare-number rule.
-var volatile = []struct {
-	re   *regexp.Regexp
-	repl string
-}{
-	{regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?`), "<ts>"},                                                // ISO 8601
-	{regexp.MustCompile(`(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT`), "<ts>"}, // RFC 1123
-	{regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), "<uuid>"},
-	{regexp.MustCompile(`\b[0-9a-fA-F]{16,64}\b`), "<hex>"}, // request ids, hashes
-	{regexp.MustCompile(`\b\d{10,19}\b`), "<num>"},          // unix seconds/millis, counters
-}
-
-// normalize masks volatile content so it never reads as drift.
-func normalize(body string) string {
-	for _, v := range volatile {
-		body = v.re.ReplaceAllString(body, v.repl)
-	}
-	return body
 }
 
 // sampled is one path's observed behavior: two requests, normalized.
@@ -342,7 +320,7 @@ func sample(c *http.Client, addr, path string) (sampled, error) {
 	if err != nil {
 		return sampled{}, err
 	}
-	n1, n2 := normalize(b1), normalize(b2)
+	n1, n2 := respdiff.Normalize(b1), respdiff.Normalize(b2)
 	return sampled{status: s1, body: n1, dynamic: n1 != n2 || s1 != s2}, nil
 }
 
@@ -357,11 +335,4 @@ func get(c *http.Client, addr, path string) (int, string, error) {
 		return 0, "", err
 	}
 	return resp.StatusCode, string(body), nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

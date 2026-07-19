@@ -21,6 +21,7 @@ const (
 	EventDriftHealed      = "drift_healed"
 	EventPushRejected     = "push_rejected"
 	EventCleanBuildFailed = "clean_build_failed"
+	EventReplayMismatch   = "replay_mismatch"
 )
 
 var headlines = map[string]string{
@@ -28,6 +29,7 @@ var headlines = map[string]string{
 	EventDriftHealed:      "drift healed - live behavior matches the clean build again",
 	EventPushRejected:     "push rejected - fork failed verification and was destroyed",
 	EventCleanBuildFailed: "clean build failed - the archivist cannot reproduce the app from source",
+	EventReplayMismatch:   "replay mismatch - the fork answered recorded live traffic differently",
 }
 
 // Notifier posts events to a webhook. A nil Notifier or empty URL is a

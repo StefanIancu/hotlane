@@ -18,6 +18,7 @@ import (
 	"github.com/StefanIancu/hotlane/internal/notify"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/proxy"
+	"github.com/StefanIancu/hotlane/internal/replay"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
 
@@ -26,11 +27,12 @@ import (
 // cmdServe wires exactly one today; multi-app daemons (docs/multi-app.md)
 // will wire one per config behind the shared listeners.
 type appRuntime struct {
-	cfg   *config.Config
-	pool  *pool.Pool
-	front *proxy.Flipper
-	arch  *archive.Archivist
-	notif *notify.Notifier
+	cfg    *config.Config
+	pool   *pool.Pool
+	front  *proxy.Flipper
+	arch   *archive.Archivist
+	notif  *notify.Notifier
+	buffer *replay.Buffer // live-traffic ring; nil when replay is off
 
 	rebaseDepth int
 	holdTTL     time.Duration
@@ -67,6 +69,9 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 
 	a.notif = &notify.Notifier{URL: cfg.Notify, App: cfg.App}
 	a.arch = archive.New(cfg, a.pool.DataDir, a.notif)
+	if cfg.Replay.Enabled() {
+		a.buffer = replay.NewBuffer(0)
+	}
 	// First boot: snapshot the checkout so a clean image exists from day
 	// one. Restarts keep the existing snapshot - it holds the last
 	// promoted source, while the checkout may be stale (pushes deliver
@@ -100,6 +105,12 @@ func startDriftTicker(apps []*appRuntime) {
 // explicit error, never a silent fall-through to live - an agent must not
 // believe it tested a fork when it actually hit production.
 func (a *appRuntime) trafficHandler() http.Handler {
+	live := http.Handler(a.front)
+	if a.buffer != nil {
+		// Only genuinely live-bound traffic is recorded: fork pokes are
+		// routed away above, so they never pollute the replay buffer.
+		live = replay.Capture(live, a.buffer, a.cfg.Replay.MethodSet(), a.cfg.Replay.Exclude)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fv := r.Header.Get("X-Hotlane-Fork"); fv != "" {
 			n, err := strconv.Atoi(fv)
@@ -112,8 +123,19 @@ func (a *appRuntime) trafficHandler() http.Handler {
 			http.Error(w, "hotlane: no held fork "+fv+" (expired, promoted, or discarded?)", http.StatusMisdirectedRequest)
 			return
 		}
-		a.front.ServeHTTP(w, r)
+		live.ServeHTTP(w, r)
 	})
+}
+
+// runReplay replays the buffered live slice against a verified fork.
+// Nil when replay is off or nothing is buffered yet.
+func (a *appRuntime) runReplay(backend string) *replay.Result {
+	if a.buffer == nil {
+		return nil
+	}
+	entries := a.buffer.Snapshot(a.cfg.Replay.Last)
+	res := replay.Run(entries, a.buffer.Len(), backend, a.cfg.Replay.BudgetOrDefault())
+	return &res
 }
 
 // forkBase picks what to fork from: the clean image instead of the warm
@@ -163,7 +185,21 @@ func (a *appRuntime) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"ring":            a.pool.Ring(),
 		"held":            a.pool.HeldList(),
 		"archive":         a.arch.Status(),
+		"replay":          a.replayStatus(),
 	})
+}
+
+// replayStatus is the status block's replay summary.
+func (a *appRuntime) replayStatus() map[string]any {
+	if a.buffer == nil {
+		return map[string]any{"enabled": false}
+	}
+	return map[string]any{
+		"enabled":  true,
+		"mode":     a.cfg.Replay.ModeOrDefault(),
+		"buffered": a.buffer.Len(),
+		"last":     a.cfg.Replay.Last,
+	}
 }
 
 func (a *appRuntime) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +275,23 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(out)
 		return
 	}
+
+	// Shadow testing: replay recorded live traffic at the verified fork
+	// before it takes over. gate mode treats a mismatch exactly like a
+	// failing verify hook; report mode promotes and tells the truth.
+	if out.Replay = a.runReplay(res.Backend); out.Replay != nil && out.Replay.Mismatched > 0 {
+		detail := fmt.Sprintf("v%d: %d/%d replayed requests answered differently (e.g. %s %s)",
+			res.Version, out.Replay.Mismatched, out.Replay.Replayed,
+			out.Replay.Mismatches[0].Method, out.Replay.Mismatches[0].Path)
+		a.notif.Send(notify.EventReplayMismatch, detail)
+		if a.cfg.Replay.Gate() {
+			out.Promoted = false
+			out.Logs = a.pool.Discard(res)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+	}
 	a.pool.Promote(res)
 	a.front.Set(res.Backend)
 	if err := a.arch.Snapshot(a.pool.ShadowDir()); err != nil {
@@ -278,6 +331,15 @@ func (a *appRuntime) handleTest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		json.NewEncoder(w).Encode(out)
 		return
+	}
+	// Held forks always get the replay report and never the gate: the
+	// whole point of test is that a human or agent reads the evidence
+	// and decides promote/discard themselves.
+	out.Replay = a.runReplay(res.Backend)
+	if out.Replay != nil && out.Replay.Mismatched > 0 {
+		a.notif.Send(notify.EventReplayMismatch,
+			fmt.Sprintf("held v%d: %d/%d replayed requests answered differently",
+				res.Version, out.Replay.Mismatched, out.Replay.Replayed))
 	}
 	if err := a.pool.Hold(res, a.holdTTL); err != nil {
 		a.pool.Discard(res)

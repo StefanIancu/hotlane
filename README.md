@@ -126,6 +126,26 @@ Every state-touching command accepts `-json` for machine-readable output. The da
 
 Client commands read `HOTLANE_DAEMON` and send `HOTLANE_TOKEN` as a bearer token. With `serve -tls-domain yourapp.example.com`, the daemon does its own HTTPS via Let's Encrypt and shares :443 the way humans expect: **your app is served at `https://yourapp.example.com/` with TLS included**, the API tucks under the reserved `/-/` prefix, and port 80 redirects. CI deploys with two secrets and one command ([full guide](docs/ci.md)).
 
+## Shadow testing, built in
+
+Verify hooks are guesses about what matters; your live traffic is the truth. With a `replay:` block, the daemon records a rolling in-memory slice of real requests - and the responses live actually served - and replays it against every fork before promotion, diffing the answers:
+
+```yaml
+replay:
+  last: 200        # newest buffered requests to replay against each fork
+  mode: report     # annotate the push; "gate" rejects a mismatch like a failing hook
+```
+
+```
+$ hotlane push
+  ok   http: /health == 200 (13ms)
+  replay 199/200 matched (2 dynamic, status-only) (312ms, 512 buffered)
+  MISMATCH GET /api/items: live answered 200, fork answers 500
+push REJECTED after 1430ms: fork destroyed, live version untouched
+```
+
+The comparison reuses the drift normalizer - timestamps, UUIDs, request ids masked, and any path that varies between two *live* requests compares status only - so dynamic content doesn't cry wolf. Reads-only by default (GET/HEAD): a fork's state is isolated, but its external side effects (your Stripe, your SMTP) are not. The buffer is memory-only and never touches disk. `hotlane test` attaches the same report to held forks, so an agent reads the diff before deciding to promote. This is [tap-compare / traffic shadowing](docs/traffic-replay.md) without the service mesh.
+
 ## The archivist
 
 The warm fork chain is a cache; the archivist is its validation. After every promote it rebuilds your app **from source, from scratch, in the background** - the image classical CI would have made, minus the waiting - pushes it to your registry, and periodically cold-boots it to diff behavior against live:

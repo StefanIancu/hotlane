@@ -30,6 +30,7 @@ import (
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/detect"
 	"github.com/StefanIancu/hotlane/internal/pool"
+	"github.com/StefanIancu/hotlane/internal/replay"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
 
@@ -40,6 +41,7 @@ type pushResponse struct {
 	Verify   []verify.Result `json:"verify"`
 	VerifyMs int64           `json:"verify_ms"`
 	Promoted bool            `json:"promoted"`
+	Replay   *replay.Result  `json:"replay,omitempty"`
 	Logs     string          `json:"logs,omitempty"`
 }
 
@@ -445,6 +447,35 @@ func cmdLogs(args []string) {
 	os.Stdout.Write(body)
 }
 
+// printReplay renders a replay verdict in push/test human output.
+func printReplay(r *replay.Result) {
+	if r == nil || r.Replayed == 0 {
+		return
+	}
+	line := fmt.Sprintf("  replay %d/%d matched", r.Matched, r.Replayed)
+	if r.Dynamic > 0 {
+		line += fmt.Sprintf(" (%d dynamic, status-only)", r.Dynamic)
+	}
+	if r.BudgetHit {
+		line += " [budget hit]"
+	}
+	fmt.Printf("%s (%dms, %d buffered)\n", line, r.Ms, r.Buffered)
+	for _, m := range r.Mismatches {
+		if m.Want == "" && m.Got != "" && m.GotStatus == 0 {
+			fmt.Printf("  MISMATCH %s %s: %s\n", m.Method, m.Path, m.Got)
+			continue
+		}
+		if m.WantStatus != m.GotStatus {
+			fmt.Printf("  MISMATCH %s %s: live answered %d, fork answers %d\n", m.Method, m.Path, m.WantStatus, m.GotStatus)
+			continue
+		}
+		fmt.Printf("  MISMATCH %s %s: live served %q, fork serves %q\n", m.Method, m.Path, m.Want, m.Got)
+	}
+	if r.Mismatched > len(r.Mismatches) {
+		fmt.Printf("  ...and %d more mismatches (see -json)\n", r.Mismatched-len(r.Mismatches))
+	}
+}
+
 // clientBase resolves the app-scoped API base for client commands: an
 // explicit -app flag wins, then HOTLANE_APP (multi-app repos often keep
 // their config in the daemon's -apps directory, not the checkout), then
@@ -580,6 +611,7 @@ func cmdPush(args []string) {
 		}
 		fmt.Println()
 	}
+	printReplay(res.Replay)
 	if !res.Promoted {
 		if res.Logs != "" {
 			fmt.Printf("--- fork logs ---\n%s\n", res.Logs)
@@ -641,6 +673,7 @@ func cmdTest(args []string) {
 	r := out.Fork
 	fmt.Printf("fork %s (v%d): snapshot %dms | patch %dms | boot %dms | verify %dms\n",
 		r.Container, r.Version, r.SnapshotMs, r.PatchMs, r.BootMs, r.VerifyMs)
+	printReplay(r.Replay)
 	fmt.Printf("HELD v%d for %s - live traffic untouched\n", r.Version, out.ExpiresIn)
 	fmt.Printf("  poke it:    curl -H %q <your-app-url>/...\n", out.Header)
 	fmt.Printf("  ship it:    hotlane promote %d\n", r.Version)

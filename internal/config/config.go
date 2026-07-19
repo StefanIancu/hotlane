@@ -66,6 +66,62 @@ type Config struct {
 	// Domain routes app traffic by Host header on the shared listeners
 	// and names the TLS certificate in multi-app mode (docs/multi-app.md).
 	Domain string `yaml:"domain,omitempty"`
+	// Replay configures traffic-replay verification (docs/traffic-replay.md).
+	Replay Replay `yaml:"replay,omitempty"`
+}
+
+// Replay is the traffic-replay verification block: record a rolling
+// slice of live traffic, replay it against the fork before promotion,
+// diff the answers against what live actually served.
+type Replay struct {
+	// Last is how many buffered requests each push replays. 0 = off.
+	Last int `yaml:"last"`
+	// Mode is "report" (annotate the push; default) or "gate" (a
+	// mismatch rejects the push like a failing verify hook).
+	Mode string `yaml:"mode,omitempty"`
+	// Methods are captured and replayed; default GET, HEAD. Anything
+	// with side effects is the operator's own loaded gun.
+	Methods []string `yaml:"methods,omitempty"`
+	// Exclude lists path prefixes never captured.
+	Exclude []string `yaml:"exclude,omitempty"`
+	// Budget caps replay wall-clock per push; default 5s. Partial
+	// coverage is reported, never silent.
+	Budget Duration `yaml:"budget,omitempty"`
+}
+
+// Enabled reports whether replay is on.
+func (r *Replay) Enabled() bool { return r.Last > 0 }
+
+// Gate reports whether mismatches reject the push.
+func (r *Replay) Gate() bool { return r.Mode == "gate" }
+
+// ModeOrDefault is the effective mode.
+func (r *Replay) ModeOrDefault() string {
+	if r.Mode == "" {
+		return "report"
+	}
+	return r.Mode
+}
+
+// MethodSet is the capture/replay method allowlist, uppercased.
+func (r *Replay) MethodSet() map[string]bool {
+	methods := r.Methods
+	if len(methods) == 0 {
+		methods = []string{"GET", "HEAD"}
+	}
+	set := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		set[strings.ToUpper(m)] = true
+	}
+	return set
+}
+
+// BudgetOrDefault is the replay wall-clock cap.
+func (r *Replay) BudgetOrDefault() time.Duration {
+	if r.Budget > 0 {
+		return time.Duration(r.Budget)
+	}
+	return 5 * time.Second
 }
 
 // Load reads and validates a hotlane.yml.
@@ -190,6 +246,15 @@ func (c *Config) validate() error {
 	}
 	if strings.ContainsAny(c.Domain, "/: ") {
 		problems = append(problems, fmt.Sprintf("domain: %q must be a bare hostname (no scheme, port, or path)", c.Domain))
+	}
+	if c.Replay.Last < 0 {
+		problems = append(problems, "replay.last: must be >= 0")
+	}
+	if m := c.Replay.Mode; m != "" && m != "report" && m != "gate" {
+		problems = append(problems, fmt.Sprintf("replay.mode: %q must be report or gate", m))
+	}
+	if c.Replay.Budget < 0 {
+		problems = append(problems, "replay.budget: must be positive")
 	}
 	for i, h := range c.Verify {
 		if (h.HTTP == "") == (h.Run == "") {

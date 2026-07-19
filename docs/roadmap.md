@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-07-19 (v0.5.0).
+Last updated: 2026-07-19 (v0.6.0).
 
 ## Shipped
 
@@ -18,10 +18,11 @@ Last updated: 2026-07-19 (v0.5.0).
 
 **v0.5** - multi-app daemons ([design](multi-app.md)): `serve -apps /etc/hotlane/apps/` runs every config in the directory behind shared listeners. Host-header routing with an explicit 421 (never a fall-through to another app), per-app rings/archivists/held forks, the `/-/v1/apps/<app>/` API namespace (bare paths stay full aliases on single-app daemons - zero client breakage), `-tls` with one Let's Encrypt cert per `domain:`, a global clean-build semaphore, `status -all`, and app selection for clients via `-app` / `HOTLANE_APP` / the local hotlane.yml. Static by design: the set of apps is what's on disk.
 
+**v0.6** - traffic-replay verification ([design](traffic-replay.md)): shadow testing built into the deploy. The proxy records a rolling in-memory slice of live traffic (with the responses live served); every push replays it against the verified fork and diffs the answers via the drift normalizer, self-dynamic paths comparing status only. `mode: report` annotates the push and pings the webhook; `mode: gate` rejects a mismatch exactly like a failing verify hook. Reads-only by default, memory-only buffer, and `hotlane test` holds carry the report for agents to read before promoting.
+
 ## Next
 
 Roughly ordered; dogfooding findings marked (df). Open an issue if your priority differs.
-- **Traffic-replay verification** - replay a recorded slice of live requests against the fork and diff responses before promoting ([design sketch](traffic-replay.md); reuses the drift normalizer, report-then-gate modes, reads-only by default)
 - **Browser-clickable fork previews** - subdomain-per-held-fork (needs wildcard DNS/DNS-01; the header covers agents today)
 - **Database branching hooks** - integrate branchable storage (Neon, ZFS/LVM snapshots) so forks can get forked state
 - **Multi-host** - a version ring gossiped across daemons behind a shared load balancer

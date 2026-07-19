@@ -169,6 +169,39 @@ echo "$OUT" | grep -q "rebased from the clean image" || fail "no rebase marker i
 echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v5"
 
+step "replay: buffer fills, report mode flags a content change but promotes"
+pkill -x hotlane; sleep 2
+printf 'replay:\n  last: 20\n' >> hotlane.yml
+git add hotlane.yml && git commit -qm "enable replay"
+"$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 30 || fail "replay daemon never came up"
+for _ in $(seq 1 6); do curl -s "http://$PROXY/" >/dev/null; done
+curl -s -H "Authorization: Bearer supersecret" "http://$API/v1/status" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['replay']['enabled'] and d['replay']['buffered'] >= 6, d['replay']
+" || fail "replay buffer not filling"
+perl -pi -e 's/hello/howdy/' message.txt
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "report-mode push rejected: $OUT"
+echo "$OUT" | grep -q "MISMATCH GET /" || fail "no replay mismatch reported in: $OUT"
+echo "$OUT" | grep -q "PROMOTED" || fail "report mode should still promote: $OUT"
+expect_body "http://$PROXY/" "howdy from demo-app v5"
+git commit -qam howdy   # align HEAD with the promoted source for the next dirty diff
+
+step "replay: gate mode rejects what verify hooks missed"
+pkill -x hotlane; sleep 2
+perl -pi -e 's/^  last: 20$/  last: 20\n  mode: gate/' hotlane.yml
+git commit -qam "gate replay"
+"$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 30 || fail "gate daemon never came up"
+for _ in $(seq 1 6); do curl -s "http://$PROXY/" >/dev/null; done
+perl -pi -e 's/howdy/sneaky/' message.txt
+if OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push 2>&1)"; then fail "gated mismatch was promoted: $OUT"; fi
+echo "$OUT" | grep -q "MISMATCH GET /" || fail "no mismatch detail in gate rejection: $OUT"
+echo "$OUT" | grep -q "REJECTED" || fail "no REJECTED in gate output: $OUT"
+expect_body "http://$PROXY/" "howdy from demo-app v5"
+git checkout -q message.txt
+
 step "multi-app: two apps from one -apps dir, host-routed"
 pkill -x hotlane; sleep 2
 MAPPS="$TMP/apps"; mkdir -p "$MAPPS"
