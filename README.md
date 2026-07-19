@@ -122,7 +122,7 @@ DRIFTED: behavior differs on /: clean build serves "hello", live serves "TAMPERE
 next push will rebuild from hotlane-api:clean
 ```
 
-Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. Fast lane and audit trail, both real.
+Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. The clean image also keeps the fast lane sustainable: fork chains auto-rebase onto it every ~40 pushes, so agent-speed pushing never hits Docker's layer-depth limit. Fast lane and audit trail, both real.
 
 ## Built for agent loops
 

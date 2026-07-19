@@ -260,6 +260,15 @@ func cmdServe(args []string) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(res)
 	})
+	// Deep commit chains eventually hit Docker's overlayfs layer limit
+	// (~125): every promoted fork adds one layer. Past rebaseDepth, forks
+	// rebase onto the archivist's clean image, resetting the chain - the
+	// same mechanics as drift recovery. Env-tunable for tests.
+	rebaseDepth := 40
+	if v, err := strconv.Atoi(os.Getenv("HOTLANE_REBASE_DEPTH")); err == nil && v > 0 {
+		rebaseDepth = v
+	}
+
 	// Pushes are serialized: forks share the shadow tree and the version
 	// counter, and one verified promote at a time is the contract.
 	var pushMu sync.Mutex
@@ -272,11 +281,15 @@ func cmdServe(args []string) {
 		pushMu.Lock()
 		defer pushMu.Unlock()
 
-		// Drift recovery: while the app is flagged drifted, forks build
-		// from the clean image instead of the warm chain.
+		// Fork from the clean image instead of the warm chain when the
+		// chain is untrustworthy (drift) or too deep (layer limit).
 		base := ""
 		if arch.Drifted() {
 			base = arch.CleanImage()
+			log.Printf("push: forking from clean (drift recovery)")
+		} else if d, err := docker.LayerDepth(p.Live); err == nil && d >= rebaseDepth && docker.ImageExists(arch.CleanImage()) {
+			base = arch.CleanImage()
+			log.Printf("push: forking from clean (layer rebase at depth %d)", d)
 		}
 		res, err := p.Fork(diff, base)
 		if err != nil {
@@ -446,6 +459,9 @@ func cmdPush(args []string) {
 	}
 	fmt.Printf("fork %s (v%d): snapshot %dms | patch %dms | boot %dms | verify %dms\n",
 		res.Container, res.Version, res.SnapshotMs, res.PatchMs, res.BootMs, res.VerifyMs)
+	if res.FromClean {
+		fmt.Println("  (rebased from the clean image)")
+	}
 	for _, v := range res.Verify {
 		mark := "ok  "
 		if !v.OK {

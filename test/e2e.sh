@@ -113,7 +113,7 @@ wait_archive 5 || fail "archive never reached v5/clean after recovery"
 
 step "auth: daemon restart adopts the live container, token gates the API"
 pkill -x hotlane; sleep 2
-"$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/" 200 30 || fail "adopt after restart failed"
 expect_body "http://$PROXY/" "hello from demo-app v4"
 if "$BIN" status >/dev/null 2>&1; then fail "API served without token"; fi

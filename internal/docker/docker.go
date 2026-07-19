@@ -155,6 +155,28 @@ func Logs(name string, n int) string {
 	return out
 }
 
+// ImageExists reports whether an image ref exists locally.
+func ImageExists(ref string) bool {
+	_, err := run("inspect", "--type", "image", ref)
+	return err == nil
+}
+
+// LayerDepth returns the number of history entries of a container's
+// image - a proxy for overlayfs layer depth, which Docker caps around
+// 125. Every promoted fork adds a layer (docker commit), so long-running
+// daemons under rapid pushing grow this without bound unless rebased.
+func LayerDepth(container string) (int, error) {
+	img, err := run("inspect", "-f", "{{.Image}}", container)
+	if err != nil {
+		return 0, err
+	}
+	out, err := run("history", "-q", img)
+	if err != nil {
+		return 0, err
+	}
+	return len(strings.Split(out, "\n")), nil
+}
+
 // RemoveImage force-removes an image (best effort cleanup of fork
 // snapshots; discarded forks must not stack images on disk).
 func RemoveImage(imageRef string) error {
