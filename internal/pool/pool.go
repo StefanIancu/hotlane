@@ -366,8 +366,11 @@ type RollbackResult struct {
 
 // Rollback flips traffic to a kept version; version 0 means the newest
 // ring entry older than live. A stopped entry is started first (its boot
-// command reruns against its own warm filesystem).
-func (p *Pool) Rollback(version int) (*RollbackResult, error) {
+// command reruns against its own warm filesystem). The ready callback
+// gates the flip: TCP-accept is not app readiness (docker's port proxy
+// accepts before the app listens), so callers pass their real check -
+// on failure the rollback aborts and the current version keeps serving.
+func (p *Pool) Rollback(version int, ready func(container, backend string) error) (*RollbackResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	start := time.Now()
@@ -408,6 +411,11 @@ func (p *Pool) Rollback(version int) (*RollbackResult, error) {
 	}
 	if err := waitReady(addr, 30*time.Second); err != nil {
 		return nil, fmt.Errorf("rollback %s: %w", target.Container, err)
+	}
+	if ready != nil {
+		if err := ready(target.Container, addr); err != nil {
+			return nil, fmt.Errorf("rollback %s: not ready: %w", target.Container, err)
+		}
 	}
 
 	old := p.Live

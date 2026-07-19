@@ -229,7 +229,19 @@ func cmdServe(args []string) {
 				return
 			}
 		}
-		res, err := p.Rollback(req.Version)
+		ready := func(container, backend string) error {
+			results, ok := verify.Run(cfg, container, backend)
+			if ok {
+				return nil
+			}
+			for _, r := range results {
+				if !r.OK {
+					return fmt.Errorf("%s - %s", r.Hook, r.Detail)
+				}
+			}
+			return fmt.Errorf("verify failed")
+		}
+		res, err := p.Rollback(req.Version, ready)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 			return
