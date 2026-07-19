@@ -25,6 +25,8 @@ import (
 
 	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
+	"github.com/StefanIancu/hotlane/internal/detect"
+	"github.com/StefanIancu/hotlane/internal/docker"
 	"github.com/StefanIancu/hotlane/internal/notify"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/proxy"
@@ -50,10 +52,14 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "init":
+		cmdInit(os.Args[2:])
 	case "serve":
 		cmdServe(os.Args[2:])
 	case "push":
 		cmdPush(os.Args[2:])
+	case "logs":
+		cmdLogs(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "rollback":
@@ -72,12 +78,59 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: hotlane <command>
 
 commands:
+  init      detect the app in the current directory and write hotlane.yml
   serve     run the daemon on this host
   push      send the current git delta to the daemon
   status    show live version, ring, and last verify results
   rollback  flip the proxy to a previous version
+  logs      tail the live version's output
   drift     cold-boot the clean image and diff its behavior against live
-  version   print version`)
+  version   print version
+
+environment:
+  HOTLANE_DAEMON  default daemon URL for client commands (default http://127.0.0.1:7433)
+  HOTLANE_TOKEN   bearer token: required by clients when serve runs with -token`)
+}
+
+// daemonDefault is the client-side daemon URL: flag > env > localhost.
+func daemonDefault() string {
+	if v := os.Getenv("HOTLANE_DAEMON"); v != "" {
+		return v
+	}
+	return "http://127.0.0.1:7433"
+}
+
+// apiRequest performs a daemon API call, attaching the bearer token from
+// HOTLANE_TOKEN when set.
+func apiRequest(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if tok := os.Getenv("HOTLANE_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// cmdInit writes a starter hotlane.yml based on what the repo looks like.
+func cmdInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	force := fs.Bool("force", false, "overwrite an existing hotlane.yml")
+	fs.Parse(args)
+
+	if _, err := os.Stat("hotlane.yml"); err == nil && !*force {
+		log.Fatal("hotlane init: hotlane.yml already exists (use -force to overwrite)")
+	}
+	g := detect.Detect(".")
+	if err := os.WriteFile("hotlane.yml", []byte(g.YAML()), 0o644); err != nil {
+		log.Fatalf("hotlane init: %v", err)
+	}
+	fmt.Printf("detected %s\nwrote hotlane.yml (app=%s image=%s port=%d)\n", g.Framework, g.App, g.Image, g.Port)
+	fmt.Println("review it - especially the verify hooks - then run: hotlane serve")
 }
 
 func cmdServe(args []string) {
@@ -85,6 +138,7 @@ func cmdServe(args []string) {
 	cfgPath := fs.String("config", "hotlane.yml", "path to hotlane.yml")
 	apiAddr := fs.String("addr", ":7433", "daemon API listen address")
 	proxyAddr := fs.String("proxy", ":7480", "app traffic listen address")
+	token := fs.String("token", os.Getenv("HOTLANE_TOKEN"), "bearer token required on the API (empty = open; keep the API loopback-only then)")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
@@ -127,6 +181,16 @@ func cmdServe(args []string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
+	})
+	mux.HandleFunc("GET /v1/logs", func(w http.ResponseWriter, r *http.Request) {
+		tail := 100
+		if t := r.URL.Query().Get("tail"); t != "" {
+			if n, err := strconv.Atoi(t); err == nil && n > 0 && n <= 10000 {
+				tail = n
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintln(w, docker.Logs(p.Live, tail))
 	})
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -219,12 +283,46 @@ func cmdServe(args []string) {
 		json.NewEncoder(w).Encode(out)
 	})
 
+	// Auth wraps the whole API except the liveness probe. The app-traffic
+	// proxy is intentionally untouched - it serves the public app.
+	var api http.Handler = mux
+	if *token != "" {
+		api = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" && r.Header.Get("Authorization") != "Bearer "+*token {
+				http.Error(w, "unauthorized (set HOTLANE_TOKEN)", http.StatusUnauthorized)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	} else {
+		log.Printf("hotlane: API is UNAUTHENTICATED - fine on loopback, set -token before exposing it")
+	}
+
 	go func() {
 		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, front.Target())
 		log.Fatal(http.ListenAndServe(*proxyAddr, front))
 	}()
 	log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, cfg.App, cfg.Ring)
-	log.Fatal(http.ListenAndServe(*apiAddr, mux))
+	log.Fatal(http.ListenAndServe(*apiAddr, api))
+}
+
+// cmdLogs tails the live version's output through the daemon.
+func cmdLogs(args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	tail := fs.Int("n", 100, "number of log lines")
+	fs.Parse(args)
+
+	resp, err := apiRequest("GET", fmt.Sprintf("%s/v1/logs?tail=%d", *daemon, *tail), "", nil)
+	if err != nil {
+		log.Fatalf("hotlane logs: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("hotlane logs: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	os.Stdout.Write(body)
 }
 
 // cmdPush sends the working tree's cumulative delta (git diff HEAD, paths
@@ -232,7 +330,7 @@ func cmdServe(args []string) {
 // tracked (`git add -N`) to appear in the diff.
 func cmdPush(args []string) {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
-	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	fs.Parse(args)
 
 	diffCmd := exec.Command("git", "diff", "HEAD", "--relative")
@@ -245,7 +343,7 @@ func cmdPush(args []string) {
 		log.Printf("hotlane push: no local changes; forking current state anyway")
 	}
 
-	resp, err := http.Post(*daemon+"/v1/push", "text/x-diff", bytes.NewReader(diff))
+	resp, err := apiRequest("POST", *daemon+"/v1/push", "text/x-diff", bytes.NewReader(diff))
 	if err != nil {
 		log.Fatalf("hotlane push: %v", err)
 	}
@@ -280,7 +378,7 @@ func cmdPush(args []string) {
 
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	fs.Parse(args)
 
 	var st struct {
@@ -323,10 +421,10 @@ func cmdStatus(args []string) {
 // behavior against live, right now.
 func cmdDrift(args []string) {
 	fs := flag.NewFlagSet("drift", flag.ExitOnError)
-	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	fs.Parse(args)
 
-	resp, err := http.Post(*daemon+"/v1/drift-check", "application/json", nil)
+	resp, err := apiRequest("POST", *daemon+"/v1/drift-check", "application/json", nil)
 	if err != nil {
 		log.Fatalf("hotlane drift: %v", err)
 	}
@@ -347,7 +445,7 @@ func cmdDrift(args []string) {
 // the one before live, `hotlane rollback 3` for v3 specifically.
 func cmdRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
-	daemon := fs.String("daemon", "http://127.0.0.1:7433", "daemon API base URL")
+	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	fs.Parse(args)
 
 	req := struct {
@@ -361,7 +459,7 @@ func cmdRollback(args []string) {
 		req.Version = v
 	}
 	body, _ := json.Marshal(req)
-	resp, err := http.Post(*daemon+"/v1/rollback", "application/json", bytes.NewReader(body))
+	resp, err := apiRequest("POST", *daemon+"/v1/rollback", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("hotlane rollback: %v", err)
 	}
@@ -382,7 +480,7 @@ func cmdRollback(args []string) {
 }
 
 func getJSON(url string, v any) {
-	resp, err := http.Get(url)
+	resp, err := apiRequest("GET", url, "", nil)
 	if err != nil {
 		log.Fatalf("hotlane: %v", err)
 	}

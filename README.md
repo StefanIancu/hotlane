@@ -39,6 +39,23 @@ push (delta)                          ~0.1s
 - **Verifier** - pluggable checks that run inside the fork before any traffic sees it: process boots, health endpoint answers, plus user hooks (smoke script, affected tests).
 - **Archivist** - async, off the critical path. Produces the canonical reproducible image after promotion and periodically cold-boots it to diff behavior against the warm instance. Drift flags the app red and the next deploy goes through the cold path. The fast lane earns trust continuously or loses it.
 
+## CLI
+
+```bash
+hotlane init         # detect the app, write a starter hotlane.yml
+hotlane serve        # run the daemon (add -token or HOTLANE_TOKEN before exposing the API)
+hotlane push         # git delta -> verified running fork -> traffic flip (~1-2s)
+hotlane rollback [n] # flip to the previous (or a specific) kept version
+hotlane status       # live version, ring, drift verdict, timings
+hotlane logs [-n N]  # tail the live version's output
+hotlane drift        # cold-boot the clean image, diff behavior vs live; exit 1 on drift
+```
+
+Client commands read `HOTLANE_DAEMON` (default `http://127.0.0.1:7433`) and send
+`HOTLANE_TOKEN` as a bearer token. The daemon API is open when started without a
+token - keep it loopback-only in that mode; the app-traffic port is always open
+by design.
+
 ## Config
 
 ```yaml
