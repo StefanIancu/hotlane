@@ -36,6 +36,11 @@ type Pool struct {
 	Backend  string // loopback host:port the proxy targets
 	Version  int
 	LastFork *ForkResult
+
+	// BaselineCommit is the git commit the pristine snapshot was taken at
+	// (empty if the source is not a git checkout). Diffs are applied
+	// against pristine, so this is the commit CI clients diff from.
+	BaselineCommit string
 }
 
 // ForkResult describes a booted fork and where the time went. The phase
@@ -435,16 +440,31 @@ func (p *Pool) Discard(res *ForkResult) string {
 func (p *Pool) pristineDir() string { return filepath.Join(p.DataDir, "pristine") }
 
 // ensurePristine snapshots the source tree the first time the daemon sees
-// this app. Diffs are applied against this copy, so serve should be started
-// from a clean checkout.
+// this app, and records the git commit that snapshot was taken at. Diffs
+// are applied against this copy, so serve should be started from a clean
+// checkout.
 func (p *Pool) ensurePristine() error {
+	commitFile := filepath.Join(p.DataDir, "baseline-commit")
 	if _, err := os.Stat(p.pristineDir()); err == nil {
+		if raw, err := os.ReadFile(commitFile); err == nil {
+			p.BaselineCommit = strings.TrimSpace(string(raw))
+		}
 		return nil
 	}
 	if err := os.MkdirAll(p.DataDir, 0o755); err != nil {
 		return err
 	}
-	return copyTree(p.Src, p.pristineDir())
+	if err := copyTree(p.Src, p.pristineDir()); err != nil {
+		return err
+	}
+	if out, err := exec.Command("git", "-C", p.Src, "rev-parse", "HEAD").Output(); err == nil {
+		p.BaselineCommit = strings.TrimSpace(string(out))
+		if err := os.WriteFile(commitFile, []byte(p.BaselineCommit+"\n"), 0o644); err != nil {
+			return err
+		}
+		log.Printf("pool: baseline commit %s", p.BaselineCommit[:12])
+	}
+	return nil
 }
 
 // ShadowDir is where the last fork's patched source tree lives; the

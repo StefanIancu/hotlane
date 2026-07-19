@@ -77,7 +77,7 @@ notify: https://hooks.slack.com/services/...  # webhook: drift detected/healed, 
 
 ## What hotlane is not
 
-- Not a CI system. Your CI keeps doing lint, tests, and review on the repo. hotlane replaces only the build+deploy jobs (the CI step becomes "curl the daemon").
+- Not a CI system. Your CI keeps doing lint, tests, and review on the repo. hotlane replaces only the build+deploy jobs - see [docs/ci.md](docs/ci.md) for GitHub Actions, GitLab, CodeBuild, and generic integration.
 - Not a Kubernetes operator. v1 targets a single host - bare metal, a VPS, an EC2 instance - which covers a huge share of real apps and all agent-loop use cases.
 - Not a reproducibility replacement. The async clean build remains the source of truth; the warm path is a fast lane, continuously reconciled against it.
 

@@ -196,13 +196,14 @@ func cmdServe(args []string) {
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"app":       cfg.App,
-			"live":      p.Live,
-			"version":   p.Version,
-			"backend":   front.Target(),
-			"last_fork": p.LastFork,
-			"ring":      p.Ring(),
-			"archive":   arch.Status(),
+			"app":             cfg.App,
+			"live":            p.Live,
+			"version":         p.Version,
+			"backend":         front.Target(),
+			"baseline_commit": p.BaselineCommit,
+			"last_fork":       p.LastFork,
+			"ring":            p.Ring(),
+			"archive":         arch.Status(),
 		})
 	})
 	mux.HandleFunc("POST /v1/drift-check", func(w http.ResponseWriter, r *http.Request) {
@@ -326,22 +327,43 @@ func cmdLogs(args []string) {
 	os.Stdout.Write(body)
 }
 
-// cmdPush sends the working tree's cumulative delta (git diff HEAD, paths
-// relative to the current directory) to the daemon. New files must be
-// tracked (`git add -N`) to appear in the diff.
+// cmdPush sends the delta to the daemon. Two modes:
+//
+//   - dirty worktree (the local dev loop): git diff HEAD --relative, i.e.
+//     your uncommitted changes. New files need `git add -N` to appear.
+//   - clean worktree (the CI loop): diff from the daemon's baseline commit
+//     to HEAD, so a fresh checkout of a newer commit deploys that commit.
+//     Override the base with -from.
 func cmdPush(args []string) {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	from := fs.String("from", "", "git ref to diff from (default: dirty worktree diffs HEAD, clean worktree diffs the daemon's baseline commit)")
 	fs.Parse(args)
 
-	diffCmd := exec.Command("git", "diff", "HEAD", "--relative")
+	// The daemon applies diffs against its pristine snapshot, so the diff
+	// base must be the baseline commit - git diff <base> covers committed
+	// AND uncommitted changes since then. HEAD is only a fallback for
+	// daemons that don't know their baseline (non-git source dir).
+	base := *from
+	if base == "" {
+		base = daemonBaseline(*daemon)
+	}
+	diffArgs := []string{"diff", "HEAD", "--relative"}
+	if base != "" {
+		if exec.Command("git", "cat-file", "-e", base+"^{commit}").Run() != nil {
+			log.Fatalf("hotlane push: baseline commit %.12s is not in this clone.\nCI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists.", base)
+		}
+		diffArgs = []string{"diff", base, "--relative"}
+	}
+
+	diffCmd := exec.Command("git", diffArgs...)
 	diffCmd.Stderr = os.Stderr
 	diff, err := diffCmd.Output()
 	if err != nil {
 		log.Fatalf("hotlane push: git diff: %v", err)
 	}
 	if len(bytes.TrimSpace(diff)) == 0 {
-		log.Printf("hotlane push: no local changes; forking current state anyway")
+		log.Printf("hotlane push: no changes vs the daemon's baseline; forking current state anyway")
 	}
 
 	resp, err := apiRequest("POST", *daemon+"/v1/push", "text/x-diff", bytes.NewReader(diff))
@@ -478,6 +500,32 @@ func cmdRollback(args []string) {
 		how = "restarted from ring"
 	}
 	fmt.Printf("ROLLED BACK to v%d (%s, %s) in %dms\n", res.Version, res.Container, how, res.TotalMs)
+}
+
+// worktreeDirty reports whether the current checkout has uncommitted
+// tracked changes.
+func worktreeDirty() bool {
+	out, err := exec.Command("git", "status", "--porcelain", "--untracked-files=no").Output()
+	return err != nil || len(bytes.TrimSpace(out)) > 0
+}
+
+// daemonBaseline asks the daemon which commit its pristine snapshot was
+// taken at. Empty when unknown (non-git source or unreachable field).
+func daemonBaseline(daemon string) string {
+	var st struct {
+		BaselineCommit string `json:"baseline_commit"`
+	}
+	resp, err := apiRequest("GET", daemon+"/v1/status", "", nil)
+	if err != nil {
+		log.Fatalf("hotlane push: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("hotlane push: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	json.Unmarshal(body, &st)
+	return st.BaselineCommit
 }
 
 func getJSON(url string, v any) {
