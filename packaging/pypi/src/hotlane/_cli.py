@@ -17,7 +17,7 @@ import certifi
 
 # The daemon/CLI release this wrapper fetches. Deliberately decoupled from
 # the package version so wrapper-only fixes don't require binary releases.
-BINARY_VERSION = "0.5.0"
+BINARY_VERSION = "0.6.0"
 
 _OS = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
 _ARCH = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm64"}.get(
