@@ -1,0 +1,291 @@
+<title>hotlane - validation-first deployment</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Push a change, get a verified running fork of your app in about a second, roll back by pointer. Images build in the background.">
+<style>
+  :root {
+    --ground: #16130f;
+    --surface: #211d17;
+    --edge: #352c22;
+    --ink: #ece4d6;
+    --ink-dim: #a3987f;
+    --accent: #ffa028;
+    --good: #8bc47a;
+    --alert: #e0604a;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ground: #faf6ee;
+      --surface: #f0e9da;
+      --edge: #ddd2bc;
+      --ink: #262016;
+      --ink-dim: #7a6f5a;
+      --accent: #c67100;
+      --good: #4a7d3a;
+      --alert: #b8402c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #16130f; --surface: #211d17; --edge: #352c22; --ink: #ece4d6;
+    --ink-dim: #a3987f; --accent: #ffa028; --good: #8bc47a; --alert: #e0604a;
+  }
+  :root[data-theme="light"] {
+    --ground: #faf6ee; --surface: #f0e9da; --edge: #ddd2bc; --ink: #262016;
+    --ink-dim: #7a6f5a; --accent: #c67100; --good: #4a7d3a; --alert: #b8402c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.7;
+  }
+  main { max-width: 60rem; margin: 0 auto; padding: 0 1.5rem 6rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; outline: none; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.72rem;
+    color: var(--accent);
+    margin: 0 0 0.75rem;
+  }
+  section { margin-top: 5.5rem; }
+  h2 { font-size: 1.15rem; margin: 0 0 1rem; text-wrap: balance; }
+  p { max-width: 42rem; margin: 0.75rem 0; color: var(--ink-dim); }
+  p strong, p b { color: var(--ink); font-weight: 600; }
+
+  /* hero */
+  header { padding-top: 5rem; }
+  .brand { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 3.5rem; }
+  .brand .name { font-weight: 700; }
+  .brand .name::before { content: "▮"; color: var(--accent); margin-right: 0.4rem; }
+  .brand nav { margin-left: auto; display: flex; gap: 1.25rem; font-size: 0.85rem; }
+  h1 {
+    font-size: clamp(1.9rem, 5vw, 3.1rem);
+    line-height: 1.15;
+    margin: 0 0 1rem;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+    max-width: 46rem;
+  }
+  h1 .ms { color: var(--accent); }
+  .sub { font-size: 1rem; max-width: 40rem; }
+
+  /* phase bar */
+  .trace { margin-top: 3rem; }
+  .trace-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 0.78rem; color: var(--ink-dim); margin-bottom: 0.5rem;
+  }
+  .trace-total { font-size: 1.3rem; color: var(--ink); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar {
+    display: flex; height: 2.4rem; border-radius: 3px; overflow: hidden;
+    background: var(--surface); border: 1px solid var(--edge);
+  }
+  .bar span {
+    height: 100%;
+    width: 0;
+    transition: width 0.9s cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+  .bar .snapshot { background: color-mix(in srgb, var(--accent) 45%, var(--surface)); transition-delay: 0.1s; }
+  .bar .patch    { background: color-mix(in srgb, var(--accent) 65%, var(--surface)); transition-delay: 0.55s; }
+  .bar .boot     { background: color-mix(in srgb, var(--accent) 85%, var(--surface)); transition-delay: 0.7s; }
+  .bar .verify   { background: var(--good); transition-delay: 1.35s; }
+  .bar.go .snapshot { width: 18.3%; }
+  .bar.go .patch    { width: 4.4%; }
+  .bar.go .boot     { width: 76%; }
+  .bar.go .verify   { width: 1.3%; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 1.25rem;
+    font-size: 0.78rem; color: var(--ink-dim); margin-top: 0.6rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .legend i { font-style: normal; display: inline-block; width: 0.65em; height: 0.65em; border-radius: 2px; margin-right: 0.45em; }
+  .legend .snapshot i { background: color-mix(in srgb, var(--accent) 45%, var(--surface)); }
+  .legend .patch i    { background: color-mix(in srgb, var(--accent) 65%, var(--surface)); }
+  .legend .boot i     { background: color-mix(in srgb, var(--accent) 85%, var(--surface)); }
+  .legend .verify i   { background: var(--good); }
+  @media (prefers-reduced-motion: reduce) {
+    .bar span { transition: none; }
+    .bar .snapshot { width: 18.3%; } .bar .patch { width: 4.4%; }
+    .bar .boot { width: 76%; } .bar .verify { width: 1.3%; }
+  }
+
+  /* terminal */
+  .term {
+    background: var(--surface);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 1.1rem 1.3rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.75;
+  }
+  .term pre { margin: 0; }
+  .term .ps1 { color: var(--accent); }
+  .term .ok { color: var(--good); }
+  .term .bad { color: var(--alert); }
+  .term .dim { color: var(--ink-dim); }
+
+  /* steps: a real sequence, numbering carries order */
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; margin-top: 1.5rem; }
+  .step { background: var(--surface); border: 1px solid var(--edge); border-radius: 6px; padding: 1.1rem 1.2rem; }
+  .step .n { color: var(--accent); font-size: 0.78rem; }
+  .step h3 { margin: 0.3rem 0 0.5rem; font-size: 0.95rem; }
+  .step p { font-size: 0.85rem; margin: 0; }
+
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 0.88rem; }
+  .table-wrap { overflow-x: auto; }
+  th, td { text-align: left; padding: 0.55rem 1rem 0.55rem 0; border-bottom: 1px solid var(--edge); }
+  th { color: var(--ink-dim); font-weight: 400; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.1em; }
+  td.num { color: var(--ink); }
+  td .win { color: var(--good); }
+
+  .footer { margin-top: 6rem; padding-top: 1.5rem; border-top: 1px solid var(--edge); font-size: 0.8rem; color: var(--ink-dim); display: flex; gap: 1.5rem; flex-wrap: wrap; }
+</style>
+
+<main>
+  <header>
+    <div class="brand">
+      <span class="name">hotlane</span>
+      <nav>
+        <a href="https://github.com/StefanIancu/hotlane">github</a>
+        <a href="#install">install</a>
+      </nav>
+    </div>
+    <p class="eyebrow">validation-first deployment</p>
+    <h1>Your pipeline rebuilds the world. hotlane forks it - and ships in <span class="ms">978&hairsp;ms</span>.</h1>
+    <p class="sub">Push a change and hotlane forks the app that is <strong>already running</strong>, applies your delta, verifies the fork in isolation, and flips traffic to it. Rollback is a pointer, not a pipeline.</p>
+
+    <div class="trace" aria-label="Phase breakdown of a real push">
+      <div class="trace-head">
+        <span>one real push, end to end</span>
+        <span class="trace-total" id="total">0 ms</span>
+      </div>
+      <div class="bar" id="bar">
+        <span class="snapshot" title="snapshot 179ms"></span><span class="patch" title="patch 43ms"></span><span class="boot" title="boot 743ms"></span><span class="verify" title="verify 13ms"></span>
+      </div>
+      <div class="legend">
+        <span class="snapshot"><i></i>snapshot 179ms</span>
+        <span class="patch"><i></i>patch 43ms</span>
+        <span class="boot"><i></i>boot 743ms</span>
+        <span class="verify"><i></i>verify 13ms</span>
+      </div>
+    </div>
+  </header>
+
+  <section>
+    <p class="eyebrow">the loop</p>
+    <h2>Edit. Push. Verified live. Undo.</h2>
+    <div class="term"><pre>
+<span class="ps1">$</span> hotlane push
+fork hotlane-api-v7 (v7): snapshot 179ms | patch 43ms | boot 743ms | verify 13ms
+  <span class="ok">ok</span>   http: /health == 200 (13ms)
+<span class="ok">PROMOTED v7 live in 978ms</span>
+
+<span class="ps1">$</span> hotlane rollback
+<span class="ok">ROLLED BACK to v6</span> (hotlane-api-v6, restarted from ring) <span class="dim">in 678ms</span>
+</pre></div>
+    <p>A fork that fails verification never sees a byte of traffic - it is destroyed, and you get the failing hook plus the fork's last log lines:</p>
+    <div class="term"><pre>
+<span class="ps1">$</span> hotlane push
+  <span class="bad">FAIL</span> http: /health == 200 - want 200, got 500
+<span class="bad">push REJECTED</span>: fork destroyed, <span class="dim">live version untouched</span>
+</pre></div>
+  </section>
+
+  <section>
+    <p class="eyebrow">how it works</p>
+    <h2>The running app is the deploy unit - not a cold-built image.</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="n">1</span>
+        <h3>fork</h3>
+        <p>Snapshot the live container - warm dependency caches and incremental build state ride along free - and apply your git delta to the copy.</p>
+      </div>
+      <div class="step">
+        <span class="n">2</span>
+        <h3>verify</h3>
+        <p>The fork boots on a side port and must pass your hooks: health checks, smoke scripts. Production traffic never touches an unverified fork.</p>
+      </div>
+      <div class="step">
+        <span class="n">3</span>
+        <h3>flip</h3>
+        <p>Promotion swaps a proxy pointer. The old version stays parked in a ring - rollback restarts it and flips back in well under a second.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">the archivist</p>
+    <h2>Fast because it reuses. Trustworthy because it never stops checking.</h2>
+    <p>Copies of copies rot: stray state accumulates, someone hotfixes a container by hand, and git quietly stops describing production. So after every promote, hotlane rebuilds your app <strong>from source, from scratch, in the background</strong> - the image classical CI would have made, minus the waiting - and periodically boots that clean build to diff its behavior against live.</p>
+    <div class="term"><pre>
+<span class="ps1">$</span> hotlane drift
+<span class="bad">DRIFTED</span>: behavior differs on /: clean build serves <span class="ok">"hello"</span>, live serves <span class="bad">"TAMPERED"</span>
+next push will rebuild from hotlane-api:clean
+</pre></div>
+    <p>Divergence pings your webhook (Slack or Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. Every version is also pushed to your registry as a durable, pullable, from-source image: the audit trail survives the host.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">measured, not promised</p>
+    <h2>Benchmarked against a real production pipeline.</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>path</th><th>push to verified live (median)</th><th>rollback</th></tr>
+      <tr><td>GitHub Actions pipeline (15 real runs)</td><td class="num">8m 13s</td><td class="num">re-run the pipeline</td></tr>
+      <tr><td>hotlane - TypeScript / Express</td><td class="num">1.72s <span class="win">~286x</span></td><td class="num">0.64s</td></tr>
+      <tr><td>hotlane - FastAPI</td><td class="num">1.18s <span class="win">~417x</span></td><td class="num">0.65s</td></tr>
+    </table>
+    </div>
+    <p>Small apps with real build steps (tsc, pip), 10 runs each. Your own build and boot time dominate the total - the machinery itself adds well under half a second. Full method and caveats in the repo.</p>
+  </section>
+
+  <section id="install">
+    <p class="eyebrow">install</p>
+    <h2>One binary. It is the daemon and the CLI.</h2>
+    <div class="term"><pre>
+<span class="dim"># shipping with v0.1</span>
+npm install -g hotlane        <span class="dim"># or: pip install hotlane</span>
+
+cd your-app
+hotlane init                  <span class="dim"># detects Node / Python / Go, writes hotlane.yml</span>
+hotlane serve                 <span class="dim"># boots the warm pool, proxies traffic</span>
+hotlane push                  <span class="dim"># ~1s later: verified and live</span>
+</pre></div>
+    <p>Runs anywhere Docker runs: your VPS, bare metal, a Raspberry Pi, any cloud. No Kubernetes, no YAML zoo - one daemon, one config file.</p>
+  </section>
+
+  <div class="footer">
+    <span>MIT licensed</span>
+    <a href="https://github.com/StefanIancu/hotlane">github.com/StefanIancu/hotlane</a>
+    <span>built for loops measured in seconds - human or agent</span>
+  </div>
+</main>
+
+<script>
+  const bar = document.getElementById("bar");
+  const total = document.getElementById("total");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) {
+    total.textContent = "978 ms";
+  } else {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      bar.classList.add("go");
+      const t0 = performance.now();
+      const tick = (now) => {
+        const v = Math.min(978, Math.round(((now - t0) / 2350) * 978));
+        total.textContent = v + " ms";
+        if (v < 978) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }));
+  }
+</script>

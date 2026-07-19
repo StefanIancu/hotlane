@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hotlane"
-version = "0.0.1"
-description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer. Name reserved while the MVP is built."
+version = "0.1.0"
+description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Stefan Iancu" }]
@@ -13,8 +13,11 @@ requires-python = ">=3.9"
 keywords = ["deployment", "ci-cd", "rollback", "warm-deploy", "agentic"]
 
 [project.urls]
-Homepage = "https://github.com/StefanIancu/hotlane"
+Homepage = "https://hotlane.dev"
 Repository = "https://github.com/StefanIancu/hotlane"
+
+[project.scripts]
+hotlane = "hotlane._cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hotlane"]

@@ -2,6 +2,8 @@
 
 **Validation-first deployment.** Push a change, get a verified running fork of your app in seconds, promote it with an atomic traffic flip, roll back in milliseconds. The container image is built in the background, off the critical path.
 
+![hotlane demo: edit, push, verified live in ~1s, rollback in ~700ms](docs/demo.gif)
+
 > Status: pre-MVP. Design is settled, daemon is being built. See [docs/mvp.md](docs/mvp.md) for scope.
 
 ## Why

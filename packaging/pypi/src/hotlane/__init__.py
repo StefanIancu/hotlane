@@ -1,6 +1,7 @@
 """hotlane - validation-first deployment.
 
-Name reserved while the MVP is built: https://github.com/StefanIancu/hotlane
+This package installs a launcher that fetches the platform binary from
+GitHub Releases on first run: https://github.com/StefanIancu/hotlane
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
