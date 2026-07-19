@@ -1,10 +1,12 @@
 [package]
 name = "hotlane"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer. Name reserved while the MVP is built."
+description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer. Install the CLI via npm/pip - this crate holds the name."
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/StefanIancu/hotlane"
-homepage = "https://github.com/StefanIancu/hotlane"
+homepage = "https://hotlane.dev"
+documentation = "https://github.com/StefanIancu/hotlane"
 keywords = ["deployment", "ci-cd", "rollback", "devops"]
 categories = ["development-tools"]
