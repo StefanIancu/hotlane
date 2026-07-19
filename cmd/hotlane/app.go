@@ -78,12 +78,21 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 		}
 	}
 	go a.arch.Archive(a.pool.Version, a.pool.Backend)
+	return a, nil
+}
+
+// startDriftTicker runs the daemon's one periodic drift check. Apps
+// check sequentially, not in parallel - each check cold-boots a
+// container, and N apps doing that at the same instant would spike the
+// box for no gain.
+func startDriftTicker(apps []*appRuntime) {
 	go func() {
 		for range time.Tick(6 * time.Hour) {
-			a.arch.DriftCheck(a.pool.Backend)
+			for _, a := range apps {
+				a.arch.DriftCheck(a.pool.Backend)
+			}
 		}
 	}()
-	return a, nil
 }
 
 // trafficHandler serves the app's public traffic: live by default; the

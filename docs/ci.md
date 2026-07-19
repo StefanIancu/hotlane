@@ -176,6 +176,8 @@ sudo systemctl enable --now hotlane
 
 Services run without `$HOME`, so the daemon keeps its state (fork ring, clean-image snapshots, autocert cache) in `/var/lib/hotlane` - `StateDirectory=hotlane` in the unit has systemd create it with the right ownership. Secrets stay in `/etc/hotlane/env`: `HOTLANE_TOKEN` becomes the API token, and any `${VAR}` references in `hotlane.yml` (e.g. `notify: ${HOTLANE_NOTIFY_URL}`) interpolate from the same file.
 
+Hosting several apps on the box? Point the unit at a config directory instead: `ExecStart=/usr/local/bin/hotlane serve -apps /etc/hotlane/apps -tls`, one `*.yml` per app (each with `src:` and `domain:`), no `WorkingDirectory` needed. One unit, one token, every app.
+
 ## Where the trust guarantees live
 
 Nothing about CI integration weakens the model: a push from CI goes through the same fork-verify-flip gate as a local one, the ring keeps instant rollback, and the archivist still produces the registry-pushed, from-source image for every promoted version plus behavioral drift checks against it. Your pipeline gets faster; the audit trail stays.

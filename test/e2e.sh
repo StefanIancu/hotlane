@@ -13,10 +13,12 @@ DLOG="$TMP/daemon.log"
 
 cleanup() {
   pkill -x hotlane 2>/dev/null || true
-  for c in $(docker ps -aq --filter label=hotlane.app=demo); do docker rm -f "$c" >/dev/null 2>&1 || true; done
-  docker rm -f hotlane-demo-drift >/dev/null 2>&1 || true
-  docker rmi -f $(docker images -q hotlane-demo) >/dev/null 2>&1 || true
-  rm -rf "$HOME/.hotlane/demo"
+  for app in demo alpha beta; do
+    for c in $(docker ps -aq --filter label=hotlane.app=$app); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    docker rm -f "hotlane-$app-drift" >/dev/null 2>&1 || true
+    docker rmi -f $(docker images -q "hotlane-$app") >/dev/null 2>&1 || true
+    rm -rf "$HOME/.hotlane/$app"
+  done
 }
 trap 'code=$?; [ $code -ne 0 ] && { echo "--- daemon log:"; cat "$DLOG" 2>/dev/null; }; cleanup; exit $code' EXIT
 
@@ -166,5 +168,60 @@ OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "rebase push rejected: $O
 echo "$OUT" | grep -q "rebased from the clean image" || fail "no rebase marker in: $OUT"
 echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v5"
+
+step "multi-app: two apps from one -apps dir, host-routed"
+pkill -x hotlane; sleep 2
+MAPPS="$TMP/apps"; mkdir -p "$MAPPS"
+for app in alpha beta; do
+  mkdir -p "$TMP/srv-$app"
+  cp "$ROOT"/example/demo-app/server.js "$TMP/srv-$app/"
+  echo "hello from $app" > "$TMP/srv-$app/message.txt"
+  (cd "$TMP/srv-$app" && git init -q && git config user.email ci@hotlane.dev && git config user.name ci && git add -A && git commit -qm baseline)
+  cat > "$MAPPS/$app.yml" <<EOF
+app: $app
+image: node:22-alpine
+run: node server.js
+port: 3000
+src: ../srv-$app
+domain: $app.local
+verify:
+  - http: /health == 200
+EOF
+done
+"$BIN" serve -apps "$MAPPS" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$API/healthz" 200 90 || fail "multi-app daemon never came up"
+curl -s "http://$API/healthz" | grep -q "ok apps=2" || fail "healthz should count apps, not name them"
+host_body() { curl -s -H "Host: $1" "http://$PROXY/"; }
+for _ in $(seq 1 60); do
+  [ "$(host_body alpha.local)" = "hello from alpha from demo-app v1" ] && \
+  [ "$(host_body beta.local)" = "hello from beta from demo-app v1" ] && break
+  sleep 2
+done
+[ "$(host_body alpha.local)" = "hello from alpha from demo-app v1" ] || fail "alpha not routed"
+[ "$(host_body beta.local)" = "hello from beta from demo-app v1" ] || fail "beta not routed"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: nope.local' "http://$PROXY/")" = "421" ] || fail "unknown host should 421, never fall through"
+
+step "multi-app: CLI push (-app) updates one app, the other untouched"
+cd "$TMP/srv-alpha"
+perl -pi -e 's/hello from alpha/ALPHA v2/' message.txt
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push -app alpha)" || fail "alpha push rejected: $OUT"
+echo "$OUT" | grep -q "PROMOTED v2" || fail "no PROMOTED v2 in: $OUT"
+[ "$(host_body alpha.local)" = "ALPHA v2 from demo-app v1" ] || fail "alpha not updated"
+[ "$(host_body beta.local)" = "hello from beta from demo-app v1" ] || fail "beta changed by alpha's push"
+
+step "multi-app: rejected push (HOTLANE_APP) harms neither app"
+cd "$TMP/srv-beta"
+perl -pi -e 's/writeHead\(200/writeHead(500/g' server.js
+if OUT="$(HOTLANE_TOKEN=supersecret HOTLANE_APP=beta "$BIN" push 2>&1)"; then fail "broken beta push promoted: $OUT"; fi
+echo "$OUT" | grep -q "REJECTED" || fail "no REJECTED in: $OUT"
+[ "$(host_body beta.local)" = "hello from beta from demo-app v1" ] || fail "beta live changed after rejection"
+[ "$(host_body alpha.local)" = "ALPHA v2 from demo-app v1" ] || fail "alpha harmed by beta's rejection"
+
+step "multi-app: bare routes refuse with directions, status -all lists both"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer supersecret' "http://$API/v1/status")" = "400" ] || fail "bare status should 400 on a multi-app daemon"
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" status -all)" || fail "status -all failed"
+echo "$OUT" | grep -q "alpha" || fail "status -all missing alpha: $OUT"
+echo "$OUT" | grep -q "beta" || fail "status -all missing beta: $OUT"
+cd "$APP"
 
 printf '\nALL E2E CHECKS PASSED\n'

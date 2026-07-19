@@ -61,6 +61,7 @@ var mcpTools = []mcpTool{
 func cmdMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	fs.Parse(args)
 
 	in := bufio.NewScanner(os.Stdin)
@@ -111,7 +112,7 @@ func cmdMCP(args []string) {
 				Arguments map[string]any `json:"arguments"`
 			}
 			json.Unmarshal(req.Params, &p)
-			text, isErr := mcpCall(*daemon, p.Name, p.Arguments)
+			text, isErr := mcpCall(*daemon, clientBase(*appName), p.Name, p.Arguments)
 			reply(req.ID, map[string]any{
 				"content": []map[string]any{{"type": "text", "text": text}},
 				"isError": isErr,
@@ -124,7 +125,7 @@ func cmdMCP(args []string) {
 
 // mcpCall dispatches one tool invocation against the daemon API and
 // returns the response body (JSON text) and whether it is an error.
-func mcpCall(daemon, name string, args map[string]any) (string, bool) {
+func mcpCall(daemon, base, name string, args map[string]any) (string, bool) {
 	argInt := func(k string) int {
 		if v, ok := args[k].(float64); ok {
 			return int(v)
@@ -135,8 +136,8 @@ func mcpCall(daemon, name string, args map[string]any) (string, bool) {
 		v, _ := args[k].(string)
 		return v
 	}
-	do := func(method, path string, body io.Reader, contentType string) (string, bool) {
-		resp, err := apiRequest(method, daemon+path, contentType, body)
+	do := func(method, path string, body []byte, contentType string) (string, bool) {
+		resp, err := appRequest(method, daemon, base, path, contentType, body)
 		if err != nil {
 			return fmt.Sprintf(`{"error":%q}`, err.Error()), true
 		}
@@ -148,38 +149,38 @@ func mcpCall(daemon, name string, args map[string]any) (string, bool) {
 		}
 		return txt, resp.StatusCode >= 400
 	}
-	jsonBody := func(v any) io.Reader {
+	jsonBody := func(v any) []byte {
 		b, _ := json.Marshal(v)
-		return bytes.NewReader(b)
+		return b
 	}
 
 	switch name {
 	case "hotlane_status":
-		return do("GET", "/-/v1/status", nil, "")
+		return do("GET", "/status", nil, "")
 	case "hotlane_push", "hotlane_test":
-		diff, err := computeDiffE(daemon, argStr("from"))
+		diff, err := computeDiffE(daemon, base, argStr("from"))
 		if err != nil {
 			return fmt.Sprintf(`{"error":%q}`, err.Error()), true
 		}
-		path := "/-/v1/push"
+		path := "/push"
 		if name == "hotlane_test" {
-			path = "/-/v1/test"
+			path = "/test"
 		}
-		return do("POST", path, bytes.NewReader(diff), "text/x-diff")
+		return do("POST", path, diff, "text/x-diff")
 	case "hotlane_promote":
-		return do("POST", "/-/v1/promote", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		return do("POST", "/promote", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
 	case "hotlane_discard":
-		return do("POST", "/-/v1/discard", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		return do("POST", "/discard", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
 	case "hotlane_rollback":
-		return do("POST", "/-/v1/rollback", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		return do("POST", "/rollback", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
 	case "hotlane_drift":
-		return do("POST", "/-/v1/drift-check", nil, "application/json")
+		return do("POST", "/drift-check", nil, "application/json")
 	case "hotlane_logs":
 		tail := argInt("tail")
 		if tail <= 0 {
 			tail = 100
 		}
-		return do("GET", fmt.Sprintf("/-/v1/logs?tail=%d", tail), nil, "")
+		return do("GET", fmt.Sprintf("/logs?tail=%d", tail), nil, "")
 	default:
 		return fmt.Sprintf(`{"error":"unknown tool %q"}`, name), true
 	}

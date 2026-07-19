@@ -107,7 +107,8 @@ most commands accept -json for machine-readable output
 
 environment:
   HOTLANE_DAEMON  default daemon URL for client commands (default http://127.0.0.1:7433)
-  HOTLANE_TOKEN   bearer token: required by clients when serve runs with -token`)
+  HOTLANE_TOKEN   bearer token: required by clients when serve runs with -token
+  HOTLANE_APP     app name on a multi-app daemon (-app flag wins; ./hotlane.yml's app: is the fallback)`)
 }
 
 // daemonDefault is the client-side daemon URL: flag > env > localhost.
@@ -216,6 +217,7 @@ func cmdServe(args []string) {
 		apps = append(apps, a)
 	}
 	single := len(apps) == 1
+	startDriftTicker(apps)
 
 	// App traffic: a single app serves every request regardless of Host -
 	// today's contract, unchanged. Multiple apps route by Host header;
@@ -427,10 +429,11 @@ func cmdServe(args []string) {
 func cmdLogs(args []string) {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	tail := fs.Int("n", 100, "number of log lines")
 	fs.Parse(args)
 
-	resp, err := apiRequest("GET", fmt.Sprintf("%s/-/v1/logs?tail=%d", *daemon, *tail), "", nil)
+	resp, err := appRequest("GET", *daemon, clientBase(*appName), fmt.Sprintf("/logs?tail=%d", *tail), "", nil)
 	if err != nil {
 		log.Fatalf("hotlane logs: %v", err)
 	}
@@ -442,12 +445,53 @@ func cmdLogs(args []string) {
 	os.Stdout.Write(body)
 }
 
+// clientBase resolves the app-scoped API base for client commands: an
+// explicit -app flag wins, then HOTLANE_APP (multi-app repos often keep
+// their config in the daemon's -apps directory, not the checkout), then
+// the app: named by the working directory's hotlane.yml, else the bare
+// single-app path. Multi-app daemons reject bare paths with directions,
+// so a client with none of these gets a loud, actionable error rather
+// than the wrong app.
+func clientBase(appFlag string) string {
+	name := appFlag
+	if name == "" {
+		name = os.Getenv("HOTLANE_APP")
+	}
+	if name == "" {
+		if c, err := config.Load("hotlane.yml"); err == nil {
+			name = c.App
+		}
+	}
+	if name == "" {
+		return "/-/v1"
+	}
+	return "/-/v1/apps/" + name
+}
+
+// appRequest performs an app-scoped API call against base+sub. A 404
+// from the namespaced path retries the bare path once: daemons predating
+// the /apps namespace (<= 0.4.x) only serve the bare routes.
+func appRequest(method, daemon, base, sub, contentType string, body []byte) (*http.Response, error) {
+	reader := func() io.Reader {
+		if body == nil {
+			return nil
+		}
+		return bytes.NewReader(body)
+	}
+	resp, err := apiRequest(method, daemon+base+sub, contentType, reader())
+	if err != nil || base == "/-/v1" || resp.StatusCode != http.StatusNotFound {
+		return resp, err
+	}
+	resp.Body.Close()
+	return apiRequest(method, daemon+"/-/v1"+sub, contentType, reader())
+}
+
 // computeDiffE builds the delta to send: from the daemon's baseline
 // commit (or an explicit ref) to the working tree.
-func computeDiffE(daemon, from string) ([]byte, error) {
+func computeDiffE(daemon, apiBase, from string) ([]byte, error) {
 	base := from
 	if base == "" {
-		b, err := daemonBaselineE(daemon)
+		b, err := daemonBaselineE(daemon, apiBase)
 		if err != nil {
 			return nil, err
 		}
@@ -470,8 +514,8 @@ func computeDiffE(daemon, from string) ([]byte, error) {
 }
 
 // computeDiff is computeDiffE with CLI ergonomics (fatal on error).
-func computeDiff(daemon, from string) []byte {
-	diff, err := computeDiffE(daemon, from)
+func computeDiff(daemon, apiBase, from string) []byte {
+	diff, err := computeDiffE(daemon, apiBase, from)
 	if err != nil {
 		log.Fatalf("hotlane: %v", err)
 	}
@@ -491,13 +535,15 @@ func computeDiff(daemon, from string) []byte {
 func cmdPush(args []string) {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	from := fs.String("from", "", "git ref to diff from (default: dirty worktree diffs HEAD, clean worktree diffs the daemon's baseline commit)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
-	diff := computeDiff(*daemon, *from)
+	base := clientBase(*appName)
+	diff := computeDiff(*daemon, base, *from)
 
-	resp, err := apiRequest("POST", *daemon+"/-/v1/push", "text/x-diff", bytes.NewReader(diff))
+	resp, err := appRequest("POST", *daemon, base, "/push", "text/x-diff", diff)
 	if err != nil {
 		log.Fatalf("hotlane push: %v", err)
 	}
@@ -548,12 +594,14 @@ func cmdPush(args []string) {
 func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	from := fs.String("from", "", "git ref to diff from (default: the daemon's baseline commit)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
-	diff := computeDiff(*daemon, *from)
-	resp, err := apiRequest("POST", *daemon+"/-/v1/test", "text/x-diff", bytes.NewReader(diff))
+	base := clientBase(*appName)
+	diff := computeDiff(*daemon, base, *from)
+	resp, err := appRequest("POST", *daemon, base, "/test", "text/x-diff", diff)
 	if err != nil {
 		log.Fatalf("hotlane test: %v", err)
 	}
@@ -602,6 +650,7 @@ func cmdTest(args []string) {
 func cmdPromote(args []string) {
 	fs := flag.NewFlagSet("promote", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -612,7 +661,7 @@ func cmdPromote(args []string) {
 		log.Fatalf("hotlane promote: version must be a number, got %q", fs.Arg(0))
 	}
 	body, _ := json.Marshal(map[string]int{"version": v})
-	resp, err := apiRequest("POST", *daemon+"/-/v1/promote", "application/json", bytes.NewReader(body))
+	resp, err := appRequest("POST", *daemon, clientBase(*appName), "/promote", "application/json", body)
 	if err != nil {
 		log.Fatalf("hotlane promote: %v", err)
 	}
@@ -634,6 +683,7 @@ func cmdPromote(args []string) {
 func cmdDiscard(args []string) {
 	fs := flag.NewFlagSet("discard", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -644,7 +694,7 @@ func cmdDiscard(args []string) {
 		log.Fatalf("hotlane discard: version must be a number, got %q", fs.Arg(0))
 	}
 	body, _ := json.Marshal(map[string]int{"version": v})
-	resp, err := apiRequest("POST", *daemon+"/-/v1/discard", "application/json", bytes.NewReader(body))
+	resp, err := appRequest("POST", *daemon, clientBase(*appName), "/discard", "application/json", body)
 	if err != nil {
 		log.Fatalf("hotlane discard: %v", err)
 	}
@@ -667,11 +717,48 @@ func cmdDiscard(args []string) {
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
+	all := fs.Bool("all", false, "list every app the daemon serves (multi-app daemons)")
 	fs.Parse(args)
 
+	if *all {
+		resp, err := apiRequest("GET", *daemon+"/-/v1/apps", "", nil)
+		if err != nil {
+			log.Fatalf("hotlane status: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			log.Fatalf("hotlane status: daemon: %s: %s (a daemon older than 0.5 has no /-/v1/apps)", resp.Status, bytes.TrimSpace(body))
+		}
+		if *jsonOut {
+			fmt.Println(string(bytes.TrimSpace(body)))
+			return
+		}
+		var list []struct {
+			App     string `json:"app"`
+			Domain  string `json:"domain"`
+			Version int    `json:"version"`
+			Live    string `json:"live"`
+			Drift   string `json:"drift"`
+		}
+		if err := json.Unmarshal(body, &list); err != nil {
+			log.Fatalf("hotlane status: bad response: %v", err)
+		}
+		for _, e := range list {
+			domain := e.Domain
+			if domain == "" {
+				domain = "-"
+			}
+			fmt.Printf("%-16s v%-4d %-28s drift %s\n", e.App, e.Version, domain, e.Drift)
+		}
+		return
+	}
+
+	base := clientBase(*appName)
 	if *jsonOut {
-		resp, err := apiRequest("GET", *daemon+"/-/v1/status", "", nil)
+		resp, err := appRequest("GET", *daemon, base, "/status", "", nil)
 		if err != nil {
 			log.Fatalf("hotlane status: %v", err)
 		}
@@ -693,7 +780,20 @@ func cmdStatus(args []string) {
 		LastFork *pool.ForkResult `json:"last_fork"`
 		Archive  archive.Status   `json:"archive"`
 	}
-	getJSON(*daemon+"/-/v1/status", &st)
+	{
+		resp, err := appRequest("GET", *daemon, base, "/status", "", nil)
+		if err != nil {
+			log.Fatalf("hotlane: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			log.Fatalf("hotlane: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+		}
+		if err := json.Unmarshal(body, &st); err != nil {
+			log.Fatalf("hotlane: bad response: %v", err)
+		}
+	}
 	fmt.Printf("app:  %s\n", st.App)
 	fmt.Printf("live: v%d (%s) -> %s\n", st.Version, st.Live, st.Backend)
 	fmt.Println("ring:")
@@ -725,10 +825,11 @@ func cmdStatus(args []string) {
 func cmdDrift(args []string) {
 	fs := flag.NewFlagSet("drift", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
-	resp, err := apiRequest("POST", *daemon+"/-/v1/drift-check", "application/json", nil)
+	resp, err := appRequest("POST", *daemon, clientBase(*appName), "/drift-check", "application/json", nil)
 	if err != nil {
 		log.Fatalf("hotlane drift: %v", err)
 	}
@@ -758,6 +859,7 @@ func cmdDrift(args []string) {
 func cmdRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	appName := fs.String("app", "", "app name on a multi-app daemon (default: HOTLANE_APP, else the app named by ./hotlane.yml)")
 	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
@@ -772,7 +874,7 @@ func cmdRollback(args []string) {
 		req.Version = v
 	}
 	body, _ := json.Marshal(req)
-	resp, err := apiRequest("POST", *daemon+"/-/v1/rollback", "application/json", bytes.NewReader(body))
+	resp, err := appRequest("POST", *daemon, clientBase(*appName), "/rollback", "application/json", body)
 	if err != nil {
 		log.Fatalf("hotlane rollback: %v", err)
 	}
@@ -808,11 +910,11 @@ func worktreeDirty() bool {
 
 // daemonBaselineE asks the daemon which commit its pristine snapshot
 // was taken at. Empty when unknown (non-git source dir).
-func daemonBaselineE(daemon string) (string, error) {
+func daemonBaselineE(daemon, apiBase string) (string, error) {
 	var st struct {
 		BaselineCommit string `json:"baseline_commit"`
 	}
-	resp, err := apiRequest("GET", daemon+"/-/v1/status", "", nil)
+	resp, err := appRequest("GET", daemon, apiBase, "/status", "", nil)
 	if err != nil {
 		return "", err
 	}
@@ -823,19 +925,4 @@ func daemonBaselineE(daemon string) (string, error) {
 	}
 	json.Unmarshal(body, &st)
 	return st.BaselineCommit, nil
-}
-
-func getJSON(url string, v any) {
-	resp, err := apiRequest("GET", url, "", nil)
-	if err != nil {
-		log.Fatalf("hotlane: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("hotlane: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
-	}
-	if err := json.Unmarshal(body, v); err != nil {
-		log.Fatalf("hotlane: bad response: %v", err)
-	}
 }

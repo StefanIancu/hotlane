@@ -171,6 +171,12 @@ func (a *Archivist) Archive(version int, liveBackend string) {
 	}
 }
 
+// buildSlots caps concurrent clean builds across every app on the
+// daemon: one Docker daemon serves them all, and N archivists building
+// at once starve the push path's own Docker work. Two slots let a
+// second app make progress without a build free-for-all.
+var buildSlots = make(chan struct{}, 2)
+
 // build generates a Dockerfile from hotlane.yml and does the cold build.
 func (a *Archivist) build() error {
 	a.mu.Lock()
@@ -192,6 +198,8 @@ func (a *Archivist) build() error {
 	if err := os.WriteFile(filepath.Join(src, ".dockerignore"), []byte(".git\nDockerfile\n"), 0o644); err != nil {
 		return err
 	}
+	buildSlots <- struct{}{}
+	defer func() { <-buildSlots }()
 	return docker.Build(src, a.CleanImage())
 }
 

@@ -101,18 +101,21 @@ notify: ${HOTLANE_NOTIFY_URL} # drift detected/healed, push rejected (Slack/Disc
 
 `notify` and `archive` interpolate `${VAR}` from the daemon's environment, so webhook URLs and registry refs never have to live in a committed file (an unset variable fails the load loudly). Build/run/verify scripts are left untouched - their `${VAR}`s belong to the shell inside the container. For running the daemon as a service, a systemd unit ships in [`packaging/systemd/`](packaging/systemd/hotlane.service) ([guide](docs/ci.md#running-the-daemon-under-systemd)); without `$HOME`, state lands in `/var/lib/hotlane`.
 
+**Several apps, one box**: `hotlane serve -apps /etc/hotlane/apps/` serves every `*.yml` in the directory. Each config adds `src:` (the app's checkout) and `domain:`; traffic routes by Host header on the shared listeners (`-tls` provisions a Let's Encrypt cert per domain), and every app keeps its own ring, archivist, held forks, and verify gate - a rejected push on one app cannot touch another. Client commands name their app via `./hotlane.yml`, `HOTLANE_APP`, or `-app`; `hotlane status -all` shows the whole box. Design notes: [docs/multi-app.md](docs/multi-app.md).
+
 ## CLI
 
 ```bash
 hotlane init         # detect the app, write a starter hotlane.yml
-hotlane serve        # run the daemon (-token / -tls-domain for a safely exposed API)
+hotlane serve        # run the daemon (-token / -tls-domain to expose safely;
+                     #   -apps DIR serves every config in a directory, -tls certs them all)
 hotlane push         # git delta -> verified running fork -> traffic flip (~1-2s)
 hotlane test         # like push, but HOLD the verified fork: poke it via the
                      #   X-Hotlane-Fork header, then promote or discard it
 hotlane promote <n>  # flip traffic to a held fork - byte-identical to what you tested
 hotlane discard <n>  # destroy a held fork; live traffic never knew
 hotlane rollback [n] # flip to the previous (or a specific) kept version
-hotlane status       # live version, ring, drift verdict, timings
+hotlane status       # live version, ring, drift verdict, timings (-all: every app)
 hotlane logs [-n N]  # tail the live version's output
 hotlane drift        # cold-boot the clean image, diff behavior vs live; exit 1 on drift
 hotlane mcp          # serve hotlane as MCP tools over stdio - agents get push/test/

@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-07-19 (v0.4.2).
+Last updated: 2026-07-19 (v0.5.0).
 
 ## Shipped
 
@@ -16,11 +16,11 @@ Last updated: 2026-07-19 (v0.4.2).
 
 **GitHub Action** - [`StefanIancu/hotlane-action@v1`](https://github.com/marketplace/actions/hotlane-deploy) on the Marketplace: install + any client command, verify verdict as outputs and a job summary ([integration guide](ci.md#github-actions)).
 
+**v0.5** - multi-app daemons ([design](multi-app.md)): `serve -apps /etc/hotlane/apps/` runs every config in the directory behind shared listeners. Host-header routing with an explicit 421 (never a fall-through to another app), per-app rings/archivists/held forks, the `/-/v1/apps/<app>/` API namespace (bare paths stay full aliases on single-app daemons - zero client breakage), `-tls` with one Let's Encrypt cert per `domain:`, a global clean-build semaphore, `status -all`, and app selection for clients via `-app` / `HOTLANE_APP` / the local hotlane.yml. Static by design: the set of apps is what's on disk.
+
 ## Next
 
 Roughly ordered; dogfooding findings marked (df). Open an issue if your priority differs.
-
-- **Multi-app daemons** - one daemon serving several hotlane.yml apps on one host ([design sketch](multi-app.md); static config directory, host-header routing, per-app machinery behind shared listeners)
 - **Traffic-replay verification** - mirror a slice of live requests into the fork and diff responses before promoting
 - **Browser-clickable fork previews** - subdomain-per-held-fork (needs wildcard DNS/DNS-01; the header covers agents today)
 - **Database branching hooks** - integrate branchable storage (Neon, ZFS/LVM snapshots) so forks can get forked state
