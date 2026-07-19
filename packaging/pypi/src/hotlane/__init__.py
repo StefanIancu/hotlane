@@ -4,4 +4,4 @@ This package installs a launcher that fetches the platform binary from
 GitHub Releases on first run: https://github.com/StefanIancu/hotlane
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
