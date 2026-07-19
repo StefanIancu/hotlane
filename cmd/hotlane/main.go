@@ -22,18 +22,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/detect"
-	"github.com/StefanIancu/hotlane/internal/docker"
-	"github.com/StefanIancu/hotlane/internal/notify"
 	"github.com/StefanIancu/hotlane/internal/pool"
-	"github.com/StefanIancu/hotlane/internal/proxy"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
 
@@ -187,53 +182,11 @@ func cmdServe(args []string) {
 		log.Fatalf("hotlane: %v", err)
 	}
 
-	root := dataRoot()
-	p := &pool.Pool{Cfg: cfg, Src: src, DataDir: filepath.Join(root, cfg.App)}
-	if err := p.Ensure(); err != nil {
-		log.Fatalf("hotlane: warm pool: %v", err)
+	a, err := newAppRuntime(cfg, src, dataRoot())
+	if err != nil {
+		log.Fatalf("hotlane: %v", err)
 	}
-
-	front := proxy.New()
-	front.Set(p.Backend)
-	p.StartHeldReaper()
-
-	// App traffic handler: live by default; the X-Hotlane-Fork header
-	// routes to a held (test-mode) fork. Unknown fork = explicit error,
-	// never a silent fall-through to live - an agent must not believe it
-	// tested a fork when it actually hit production.
-	appTraffic := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fv := r.Header.Get("X-Hotlane-Fork"); fv != "" {
-			n, err := strconv.Atoi(fv)
-			if err == nil {
-				if h := p.HeldProxy(n); h != nil {
-					h.ServeHTTP(w, r)
-					return
-				}
-			}
-			http.Error(w, "hotlane: no held fork "+fv+" (expired, promoted, or discarded?)", http.StatusMisdirectedRequest)
-			return
-		}
-		front.ServeHTTP(w, r)
-	})
-
-	notif := &notify.Notifier{URL: cfg.Notify, App: cfg.App}
-	arch := archive.New(cfg, p.DataDir, notif)
-	// First boot: snapshot the checkout so a clean image exists from day
-	// one. Restarts keep the existing snapshot - it holds the last
-	// promoted source, while the checkout may be stale (pushes deliver
-	// diffs and never touch it); overwriting it regressed the clean
-	// image and false-positived every post-restart drift check.
-	if !arch.HasSnapshot() {
-		if err := arch.Snapshot(src); err != nil {
-			log.Printf("hotlane: archive snapshot: %v", err)
-		}
-	}
-	go arch.Archive(p.Version, p.Backend)
-	go func() {
-		for range time.Tick(6 * time.Hour) {
-			arch.DriftCheck(p.Backend)
-		}
-	}()
+	appTraffic := a.trafficHandler()
 
 	mux := http.NewServeMux()
 	// handle registers every API route twice: bare (the private API port)
@@ -267,239 +220,15 @@ func cmdServe(args []string) {
 	handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
 	})
-	handle("GET /v1/logs", func(w http.ResponseWriter, r *http.Request) {
-		tail := 100
-		if t := r.URL.Query().Get("tail"); t != "" {
-			if n, err := strconv.Atoi(t); err == nil && n > 0 && n <= 10000 {
-				tail = n
-			}
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, docker.Logs(p.Live, tail))
-	})
-	handle("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"app":             cfg.App,
-			"live":            p.Live,
-			"version":         p.Version,
-			"backend":         front.Target(),
-			"baseline_commit": p.BaselineCommit,
-			"last_fork":       p.LastFork,
-			"ring":            p.Ring(),
-			"held":            p.HeldList(),
-			"archive":         arch.Status(),
-		})
-	})
-	handle("POST /v1/drift-check", func(w http.ResponseWriter, r *http.Request) {
-		st := arch.DriftCheck(p.Backend)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(st)
-	})
-	handle("POST /v1/rollback", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Version int `json:"version"`
-		}
-		if r.ContentLength > 0 {
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		ready := func(container, backend string) error {
-			results, ok := verify.Run(cfg, container, backend)
-			if ok {
-				return nil
-			}
-			for _, r := range results {
-				if !r.OK {
-					return fmt.Errorf("%s - %s", r.Hook, r.Detail)
-				}
-			}
-			return fmt.Errorf("verify failed")
-		}
-		res, err := p.Rollback(req.Version, ready)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		front.Set(res.Backend)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(res)
-	})
-	// Deep commit chains eventually hit Docker's overlayfs layer limit
-	// (~125): every promoted fork adds one layer. Past rebaseDepth, forks
-	// rebase onto the archivist's clean image, resetting the chain - the
-	// same mechanics as drift recovery. Env-tunable for tests.
-	rebaseDepth := 40
-	if v, err := strconv.Atoi(os.Getenv("HOTLANE_REBASE_DEPTH")); err == nil && v > 0 {
-		rebaseDepth = v
-	}
+	handle("GET /v1/logs", a.handleLogs)
+	handle("GET /v1/status", a.handleStatus)
+	handle("POST /v1/drift-check", a.handleDriftCheck)
+	handle("POST /v1/rollback", a.handleRollback)
+	handle("POST /v1/push", a.handlePush)
 
-	holdTTL := 15 * time.Minute
-	if v, err := time.ParseDuration(os.Getenv("HOTLANE_HOLD_TTL")); err == nil && v > 0 {
-		holdTTL = v
-	}
-
-	// Pushes are serialized: forks share the shadow tree and the version
-	// counter, and one verified promote at a time is the contract.
-	var pushMu sync.Mutex
-	handle("POST /v1/push", func(w http.ResponseWriter, r *http.Request) {
-		diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		pushMu.Lock()
-		defer pushMu.Unlock()
-
-		// Fork from the clean image instead of the warm chain when the
-		// chain is untrustworthy (drift) or too deep (layer limit).
-		base := ""
-		if arch.Drifted() {
-			base = arch.CleanImage()
-			log.Printf("push: forking from clean (drift recovery)")
-		} else if d, err := docker.LayerDepth(p.Live); err == nil && d >= rebaseDepth && docker.ImageExists(arch.CleanImage()) {
-			base = arch.CleanImage()
-			log.Printf("push: forking from clean (layer rebase at depth %d)", d)
-		}
-		res, err := p.Fork(diff, base)
-		if err != nil {
-			log.Printf("push: %v", err)
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		out := pushResponse{ForkResult: res}
-
-		vStart := time.Now()
-		out.Verify, out.Promoted = verify.Run(cfg, res.Container, res.Backend)
-		out.VerifyMs = time.Since(vStart).Milliseconds()
-		out.TotalMs += out.VerifyMs
-
-		w.Header().Set("Content-Type", "application/json")
-		if !out.Promoted {
-			out.Logs = p.Discard(res)
-			for _, v := range out.Verify {
-				if !v.OK {
-					notif.Send(notify.EventPushRejected,
-						fmt.Sprintf("v%d: %s - %s", res.Version, v.Hook, v.Detail))
-					break
-				}
-			}
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			json.NewEncoder(w).Encode(out)
-			return
-		}
-		p.Promote(res)
-		front.Set(res.Backend)
-		if err := arch.Snapshot(p.ShadowDir()); err != nil {
-			log.Printf("push: archive snapshot: %v", err)
-		} else {
-			go arch.Archive(res.Version, res.Backend)
-		}
-		json.NewEncoder(w).Encode(out)
-	})
-
-	// test: fork + verify, then HOLD instead of promote. The caller pokes
-	// the fork through the X-Hotlane-Fork header, then promotes/discards.
-	handle("POST /v1/test", func(w http.ResponseWriter, r *http.Request) {
-		diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		pushMu.Lock()
-		defer pushMu.Unlock()
-
-		base := ""
-		if arch.Drifted() {
-			base = arch.CleanImage()
-		} else if d, err := docker.LayerDepth(p.Live); err == nil && d >= rebaseDepth && docker.ImageExists(arch.CleanImage()) {
-			base = arch.CleanImage()
-		}
-		res, err := p.Fork(diff, base)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		out := pushResponse{ForkResult: res}
-		vStart := time.Now()
-		var ok bool
-		out.Verify, ok = verify.Run(cfg, res.Container, res.Backend)
-		out.VerifyMs = time.Since(vStart).Milliseconds()
-		out.TotalMs += out.VerifyMs
-		w.Header().Set("Content-Type", "application/json")
-		if !ok {
-			out.Logs = p.Discard(res)
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			json.NewEncoder(w).Encode(out)
-			return
-		}
-		if err := p.Hold(res, holdTTL); err != nil {
-			p.Discard(res)
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"fork":       out,
-			"held":       true,
-			"expires_in": holdTTL.String(),
-			"header":     fmt.Sprintf("X-Hotlane-Fork: %d", res.Version),
-		})
-	})
-	handle("POST /v1/promote", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Version int `json:"version"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		ready := func(container, backend string) error {
-			results, ok := verify.Run(cfg, container, backend)
-			if ok {
-				return nil
-			}
-			for _, rr := range results {
-				if !rr.OK {
-					return fmt.Errorf("%s - %s", rr.Hook, rr.Detail)
-				}
-			}
-			return fmt.Errorf("verify failed")
-		}
-		pushMu.Lock()
-		defer pushMu.Unlock()
-		srcDir, res, err := p.PromoteHeld(req.Version, ready)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		front.Set(res.Backend)
-		if err := arch.Snapshot(srcDir); err != nil {
-			log.Printf("promote: archive snapshot: %v", err)
-		} else {
-			go arch.Archive(res.Version, res.Backend)
-		}
-		os.RemoveAll(srcDir)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(res)
-	})
-	handle("POST /v1/discard", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Version int `json:"version"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		pushMu.Lock()
-		defer pushMu.Unlock()
-		if err := p.DiscardHeld(req.Version); err != nil {
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	})
+	handle("POST /v1/test", a.handleTest)
+	handle("POST /v1/promote", a.handlePromote)
+	handle("POST /v1/discard", a.handleDiscard)
 
 	// Auth wraps the whole API except the liveness probe. The app-traffic
 	// proxy is intentionally untouched - it serves the public app.
@@ -520,7 +249,7 @@ func cmdServe(args []string) {
 	}
 
 	go func() {
-		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, front.Target())
+		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, a.front.Target())
 		log.Fatal(http.ListenAndServe(*proxyAddr, appTraffic))
 	}()
 
@@ -533,7 +262,7 @@ func cmdServe(args []string) {
 		mgr := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(*tlsDomain),
-			Cache:      autocert.DirCache(filepath.Join(root, "autocert")),
+			Cache:      autocert.DirCache(filepath.Join(dataRoot(), "autocert")),
 		}
 		shared := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/-" || strings.HasPrefix(r.URL.Path, "/-/") {
