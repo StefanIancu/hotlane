@@ -36,7 +36,7 @@ expect_body() { # url want
 }
 wait_archive() { # version: clean image built for it, not building, drift clean
   for _ in $(seq 1 120); do
-    curl -s "http://$API/v1/status" | python3 -c "
+    curl -s -H "Authorization: Bearer supersecret" "http://$API/v1/status" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 a = d['archive']
@@ -145,5 +145,26 @@ expect_body "http://$PROXY/" "hello from demo-app v4"
 if "$BIN" status >/dev/null 2>&1; then fail "API served without token"; fi
 HOTLANE_TOKEN=supersecret "$BIN" status | grep -q "live: v7" || fail "authorized status failed"
 wait_http "http://$API/healthz" 200 5 || fail "healthz should stay open without token"
+
+step "restart keeps the promoted snapshot (stale-checkout guard)"
+wait_archive 7 || fail "drift not clean after restart - archivist re-snapshotted the dirty worktree"
+git checkout -q message.txt
+
+step "agent surfaces: API index, -json output, MCP session"
+curl -s -H "Authorization: Bearer supersecret" "http://$API/v1" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['service']=='hotlane' and len(d['routes'])>=8" || fail "API index wrong"
+HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'live' in d and 'archive' in d and 'held' in d" || fail "status -json missing keys (held?)"
+MCP_OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hotlane_status","arguments":{}}}\n' | HOTLANE_TOKEN=supersecret HOTLANE_DAEMON="http://$API" "$BIN" mcp)
+echo "$MCP_OUT" | grep -q '"name":"hotlane"' || fail "mcp initialize failed"
+echo "$MCP_OUT" | grep -q 'hotlane_push' || fail "mcp tools/list missing hotlane_push"
+echo "$MCP_OUT" | grep -q 'baseline_commit' || fail "mcp hotlane_status call failed"
+
+step "auto-rebase: a deep layer chain forks from the clean image"
+# The restarted daemon runs with HOTLANE_REBASE_DEPTH=5; the base image
+# alone has more history entries than that, so the next push must rebase.
+perl -pi -e 's/"v4"/"v5"/' server.js
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "rebase push rejected: $OUT"
+echo "$OUT" | grep -q "rebased from the clean image" || fail "no rebase marker in: $OUT"
+echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
+expect_body "http://$PROXY/" "hello from demo-app v5"
 
 printf '\nALL E2E CHECKS PASSED\n'

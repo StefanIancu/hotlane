@@ -278,6 +278,7 @@ func cmdServe(args []string) {
 			"baseline_commit": p.BaselineCommit,
 			"last_fork":       p.LastFork,
 			"ring":            p.Ring(),
+			"held":            p.HeldList(),
 			"archive":         arch.Status(),
 		})
 	})
