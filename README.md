@@ -4,7 +4,7 @@
 
 ![hotlane demo: edit, push, verified live in ~1s, rollback in ~700ms](docs/demo.gif)
 
-> Status: pre-MVP. Design is settled, daemon is being built. See [docs/mvp.md](docs/mvp.md) for scope.
+> **v0.1** - the full loop works and is [benchmarked](docs/benchmark.md): ~1s push-to-verified-live, ~0.6s rollback, drift-checked by the archivist. Young software; see the [roadmap](docs/roadmap.md).
 
 ## Why
 

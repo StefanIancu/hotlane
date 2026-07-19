@@ -12,7 +12,7 @@ Date: 2026-07-19. Verdict: **GO** - every kill criterion cleared by a wide margi
 
 Speedup vs the classical baseline: **~286x** (TS/Express) and **~417x** (FastAPI).
 
-Kill criteria from [mvp.md](mvp.md): under 30s median (result: 1.2-1.7s), at least 5x faster than the baseline (result: >280x), rollback under 1s (result: ~650ms cold), zero promotes a verify hook should have caught (result: zero; the M3 e2e separately proved a broken health check gets rejected with the live version untouched).
+The go/no-go criteria this project set for itself before writing the daemon: under 30s median (result: 1.2-1.7s), at least 5x faster than the baseline (result: >280x), rollback under 1s (result: ~650ms cold), zero promotes a verify hook should have caught (result: zero; the M3 e2e separately proved a broken health check gets rejected with the live version untouched).
 
 ## Method
 
