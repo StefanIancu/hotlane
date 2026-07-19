@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hotlane"
-version = "0.1.0"
+version = "0.1.1"
 description = "Validation-first deployment: fork a warm running instance, verify, promote via atomic proxy flip, roll back by pointer."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Stefan Iancu" }]
 requires-python = ">=3.9"
+dependencies = ["certifi"]
 keywords = ["deployment", "ci-cd", "rollback", "warm-deploy", "agentic"]
 
 [project.urls]

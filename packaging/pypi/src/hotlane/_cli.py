@@ -6,13 +6,18 @@ first `hotlane` invocation and is cached under ~/.cache/hotlane/<version>.
 
 import os
 import platform
+import ssl
 import stat
 import sys
 import tarfile
 import tempfile
 import urllib.request
 
-from . import __version__
+import certifi
+
+# The daemon/CLI release this wrapper fetches. Deliberately decoupled from
+# the package version so wrapper-only fixes don't require binary releases.
+BINARY_VERSION = "0.1.0"
 
 _OS = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
 _ARCH = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm64"}.get(
@@ -22,7 +27,7 @@ _ARCH = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm6
 
 def _cache_dir() -> str:
     base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return os.path.join(base, "hotlane", __version__)
+    return os.path.join(base, "hotlane", BINARY_VERSION)
 
 
 def _ensure_binary() -> str:
@@ -36,13 +41,16 @@ def _ensure_binary() -> str:
         )
     url = (
         "https://github.com/StefanIancu/hotlane/releases/download/"
-        f"v{__version__}/hotlane_{_OS}_{_ARCH}.tar.gz"
+        f"v{BINARY_VERSION}/hotlane_{_OS}_{_ARCH}.tar.gz"
     )
     os.makedirs(_cache_dir(), exist_ok=True)
     print(f"hotlane: fetching {url}", file=sys.stderr)
     try:
+        # certifi's bundle, not the interpreter's: stock macOS Pythons often
+        # ship without a usable system trust store.
+        ctx = ssl.create_default_context(cafile=certifi.where())
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            with urllib.request.urlopen(url) as resp:
+            with urllib.request.urlopen(url, context=ctx) as resp:
                 tmp.write(resp.read())
             tmp_path = tmp.name
         with tarfile.open(tmp_path) as tar:
