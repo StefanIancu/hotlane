@@ -41,6 +41,13 @@ push (delta)                          ~0.1s
 - **Verifier** - pluggable checks that run inside the fork before any traffic sees it: process boots, health endpoint answers, plus user hooks (smoke script, affected tests).
 - **Archivist** - async, off the critical path. Produces the canonical reproducible image after promotion and periodically cold-boots it to diff behavior against the warm instance. Drift flags the app red and the next deploy goes through the cold path. The fast lane earns trust continuously or loses it.
 
+## Install
+
+```bash
+curl -fsSL https://hotlane.dev/install.sh | sh
+# or: npm install -g hotlane  |  pip install hotlane
+```
+
 ## CLI
 
 ```bash
