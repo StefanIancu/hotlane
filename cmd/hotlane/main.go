@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -163,35 +164,87 @@ func dataRoot() string {
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "hotlane.yml", "path to hotlane.yml")
+	appsDir := fs.String("apps", "", "directory of app configs (*.yml): serve every app in it, routing traffic by Host header")
 	apiAddr := fs.String("addr", ":7433", "daemon API listen address")
 	proxyAddr := fs.String("proxy", ":7480", "app traffic listen address")
 	token := fs.String("token", os.Getenv("HOTLANE_TOKEN"), "bearer token required on the API (empty = open; keep the API loopback-only then)")
-	tlsDomain := fs.String("tls-domain", "", "serve the API over HTTPS with an auto-provisioned Let's Encrypt certificate for this domain (API defaults to :443; requires -token)")
+	tlsDomain := fs.String("tls-domain", "", "single-app: serve shared HTTPS on :443 with a Let's Encrypt certificate for this domain (requires -token; shorthand for domain: in the config plus -tls)")
+	tlsOn := fs.Bool("tls", false, "serve shared HTTPS on :443 with Let's Encrypt certificates for every configured domain: (requires -token)")
 	fs.Parse(args)
 
-	if *tlsDomain != "" && *token == "" {
-		log.Fatal("hotlane: -tls-domain exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
+	if *appsDir != "" && *tlsDomain != "" {
+		log.Fatal("hotlane: -tls-domain is single-app shorthand; with -apps, set domain: in each config and use -tls")
+	}
+	if (*tlsDomain != "" || *tlsOn) && *token == "" {
+		log.Fatal("hotlane: TLS exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
 	}
 
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		log.Fatalf("hotlane: %v", err)
-	}
-	// The source checkout: src: from the config when set (Load already
-	// resolved it against the config's directory), else the config's
-	// directory itself - serve traditionally starts inside the repo.
-	src := cfg.Src
-	if src == "" {
-		if src, err = filepath.Abs(filepath.Dir(*cfgPath)); err != nil {
+	// One config (traditional) or a directory of them (multi-app).
+	var cfgs []*config.Config
+	if *appsDir != "" {
+		var err error
+		if cfgs, err = config.LoadDir(*appsDir); err != nil {
 			log.Fatalf("hotlane: %v", err)
 		}
+	} else {
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			log.Fatalf("hotlane: %v", err)
+		}
+		// The source checkout: src: from the config when set (Load already
+		// resolved it against the config's directory), else the config's
+		// directory itself - serve traditionally starts inside the repo.
+		if cfg.Src == "" {
+			if cfg.Src, err = filepath.Abs(filepath.Dir(*cfgPath)); err != nil {
+				log.Fatalf("hotlane: %v", err)
+			}
+		}
+		if *tlsDomain != "" {
+			cfg.Domain = *tlsDomain
+			*tlsOn = true
+		}
+		cfgs = []*config.Config{cfg}
 	}
 
-	a, err := newAppRuntime(cfg, src, dataRoot())
-	if err != nil {
-		log.Fatalf("hotlane: %v", err)
+	root := dataRoot()
+	var apps []*appRuntime
+	for _, cfg := range cfgs {
+		a, err := newAppRuntime(cfg, cfg.Src, root)
+		if err != nil {
+			log.Fatalf("hotlane: %s: %v", cfg.App, err)
+		}
+		apps = append(apps, a)
 	}
-	appTraffic := a.trafficHandler()
+	single := len(apps) == 1
+
+	// App traffic: a single app serves every request regardless of Host -
+	// today's contract, unchanged. Multiple apps route by Host header;
+	// unknown host is an explicit 421, never a fall-through to some
+	// default app - serving app A's traffic to app B because of a typo'd
+	// DNS record must be impossible.
+	var appTraffic http.Handler
+	if single {
+		appTraffic = apps[0].trafficHandler()
+	} else {
+		hostTraffic := map[string]http.Handler{}
+		for _, a := range apps {
+			if a.cfg.Domain != "" {
+				hostTraffic[a.cfg.Domain] = a.trafficHandler()
+			}
+		}
+		appTraffic = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			host := r.Host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			h, ok := hostTraffic[host]
+			if !ok {
+				http.Error(w, "hotlane: no app for host "+host, http.StatusMisdirectedRequest)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
 
 	mux := http.NewServeMux()
 	// handle registers every API route twice: bare (the private API port)
@@ -203,6 +256,13 @@ func cmdServe(args []string) {
 		method, path, _ := strings.Cut(pattern, " ")
 		mux.HandleFunc(method+" /-"+path, h)
 	}
+	// The bare app-scoped paths: canonical surface for a single-app daemon
+	// (full back-compat), 400 with directions on a multi-app one - loud,
+	// not silent.
+	docBase := "/-/v1"
+	if !single {
+		docBase = "/-/v1/apps/<app>"
+	}
 	handle("GET /v1", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -211,29 +271,67 @@ func cmdServe(args []string) {
 			"docs":    "https://hotlane.dev/llms-full.txt",
 			"routes": []string{
 				"GET  /-/healthz              liveness (no auth)",
-				"GET  /-/v1/status            live version, ring, held forks, archive/drift, baseline_commit",
-				"POST /-/v1/push              body=raw git diff -> fork, verify, promote; 422 on rejection",
-				"POST /-/v1/test              body=raw git diff -> fork, verify, HOLD; returns X-Hotlane-Fork header",
-				"POST /-/v1/promote           {version} -> flip traffic to a held fork",
-				"POST /-/v1/discard           {version} -> destroy a held fork",
-				"POST /-/v1/rollback          {version?} -> flip to a kept version",
-				"POST /-/v1/drift-check       cold-boot clean image, diff behavior vs live",
-				"GET  /-/v1/logs?tail=N       live container output",
+				"GET  /-/v1/apps              apps served by this daemon",
+				"GET  " + docBase + "/status            live version, ring, held forks, archive/drift, baseline_commit",
+				"POST " + docBase + "/push              body=raw git diff -> fork, verify, promote; 422 on rejection",
+				"POST " + docBase + "/test              body=raw git diff -> fork, verify, HOLD; returns X-Hotlane-Fork header",
+				"POST " + docBase + "/promote           {version} -> flip traffic to a held fork",
+				"POST " + docBase + "/discard           {version} -> destroy a held fork",
+				"POST " + docBase + "/rollback          {version?} -> flip to a kept version",
+				"POST " + docBase + "/drift-check       cold-boot clean image, diff behavior vs live",
+				"GET  " + docBase + "/logs?tail=N       live container output",
 			},
 		})
 	})
 	handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
+		// No app-name enumeration on the one unauthenticated route.
+		if single {
+			fmt.Fprintf(w, "ok app=%s version=%s\n", apps[0].cfg.App, version)
+		} else {
+			fmt.Fprintf(w, "ok apps=%d version=%s\n", len(apps), version)
+		}
 	})
-	handle("GET /v1/logs", a.handleLogs)
-	handle("GET /v1/status", a.handleStatus)
-	handle("POST /v1/drift-check", a.handleDriftCheck)
-	handle("POST /v1/rollback", a.handleRollback)
-	handle("POST /v1/push", a.handlePush)
+	handle("GET /v1/apps", func(w http.ResponseWriter, r *http.Request) {
+		out := make([]map[string]any, 0, len(apps))
+		for _, a := range apps {
+			out = append(out, map[string]any{
+				"app":     a.cfg.App,
+				"domain":  a.cfg.Domain,
+				"version": a.pool.Version,
+				"live":    a.pool.Live,
+				"drift":   a.arch.Status().Drift,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
+	})
 
-	handle("POST /v1/test", a.handleTest)
-	handle("POST /v1/promote", a.handlePromote)
-	handle("POST /v1/discard", a.handleDiscard)
+	appRoutes := func(prefix string, a *appRuntime) {
+		handle("GET "+prefix+"/status", a.handleStatus)
+		handle("GET "+prefix+"/logs", a.handleLogs)
+		handle("POST "+prefix+"/push", a.handlePush)
+		handle("POST "+prefix+"/test", a.handleTest)
+		handle("POST "+prefix+"/promote", a.handlePromote)
+		handle("POST "+prefix+"/discard", a.handleDiscard)
+		handle("POST "+prefix+"/rollback", a.handleRollback)
+		handle("POST "+prefix+"/drift-check", a.handleDriftCheck)
+	}
+	for _, a := range apps {
+		appRoutes("/v1/apps/"+a.cfg.App, a)
+	}
+	if single {
+		appRoutes("/v1", apps[0])
+	} else {
+		multiOnly := func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "hotlane: this daemon serves multiple apps; use /-/v1/apps/<app>/...", http.StatusBadRequest)
+		}
+		for _, pat := range []string{
+			"GET /v1/status", "GET /v1/logs", "POST /v1/push", "POST /v1/test",
+			"POST /v1/promote", "POST /v1/discard", "POST /v1/rollback", "POST /v1/drift-check",
+		} {
+			handle(pat, multiOnly)
+		}
+	}
 
 	// Auth wraps the whole API except the liveness probe. The app-traffic
 	// proxy is intentionally untouched - it serves the public app.
@@ -254,20 +352,33 @@ func cmdServe(args []string) {
 	}
 
 	go func() {
-		log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, a.front.Target())
+		if single {
+			log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, apps[0].front.Target())
+		} else {
+			log.Printf("hotlane %s: app traffic on %s (%d apps, routed by Host)", version, *proxyAddr, len(apps))
+		}
 		log.Fatal(http.ListenAndServe(*proxyAddr, appTraffic))
 	}()
 
-	if *tlsDomain != "" {
-		// Shared HTTPS listener on :443: the APP owns https://domain/ (a
-		// browser typing the domain gets the app, with TLS, zero config),
-		// while the daemon API lives under the /-/ prefix. The private
-		// API listener keeps running unchanged. Certificates come from
-		// Let's Encrypt via the TLS-ALPN challenge.
+	if *tlsOn {
+		// Shared HTTPS listener on :443: each APP owns https://its-domain/
+		// (a browser typing the domain gets the app, with TLS, zero
+		// config), while the daemon API lives under the /-/ prefix. The
+		// private API listener keeps running unchanged. Certificates come
+		// from Let's Encrypt via the TLS-ALPN challenge, one per domain.
+		var domains []string
+		for _, a := range apps {
+			if a.cfg.Domain != "" {
+				domains = append(domains, a.cfg.Domain)
+			}
+		}
+		if len(domains) == 0 {
+			log.Fatal("hotlane: -tls needs at least one app with domain: set")
+		}
 		mgr := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(*tlsDomain),
-			Cache:      autocert.DirCache(filepath.Join(dataRoot(), "autocert")),
+			HostPolicy: autocert.HostWhitelist(domains...),
+			Cache:      autocert.DirCache(filepath.Join(root, "autocert")),
 		}
 		shared := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/-" || strings.HasPrefix(r.URL.Path, "/-/") {
@@ -279,19 +390,36 @@ func cmdServe(args []string) {
 		srv := &http.Server{Addr: ":443", Handler: shared, TLSConfig: mgr.TLSConfig()}
 		go func() {
 			// Best-effort http->https redirect; a busy :80 is not fatal.
+			// Single app keeps the canonical-domain redirect; multi-app
+			// redirects to the requested host (which :443 then routes).
 			redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, "https://"+*tlsDomain+r.URL.RequestURI(), http.StatusMovedPermanently)
+				target := domains[0]
+				if !single {
+					target = r.Host
+					if h, _, err := net.SplitHostPort(target); err == nil {
+						target = h
+					}
+				}
+				http.Redirect(w, r, "https://"+target+r.URL.RequestURI(), http.StatusMovedPermanently)
 			})
 			if err := http.ListenAndServe(":80", redirect); err != nil {
 				log.Printf("hotlane: :80 redirect listener: %v", err)
 			}
 		}()
 		go func() {
-			log.Printf("hotlane %s: app on https://%s/ + API on https://%s/-/ (ring=%d)", version, *tlsDomain, *tlsDomain, cfg.Ring)
+			if single {
+				log.Printf("hotlane %s: app on https://%s/ + API on https://%s/-/ (ring=%d)", version, domains[0], domains[0], apps[0].cfg.Ring)
+			} else {
+				log.Printf("hotlane %s: %d apps on :443 (%s) + API under /-/", version, len(apps), strings.Join(domains, ", "))
+			}
 			log.Fatal(srv.ListenAndServeTLS("", ""))
 		}()
 	}
-	log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, cfg.App, cfg.Ring)
+	if single {
+		log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, apps[0].cfg.App, apps[0].cfg.Ring)
+	} else {
+		log.Printf("hotlane %s: API on %s (%d apps)", version, *apiAddr, len(apps))
+	}
 	log.Fatal(http.ListenAndServe(*apiAddr, api))
 }
 
