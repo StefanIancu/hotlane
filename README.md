@@ -53,7 +53,7 @@ A fork that fails verification is destroyed - the pusher gets the failing hook a
 
 ```bash
 curl -fsSL https://hotlane.dev/install.sh | sh
-# or: npm install -g hotlane  |  pip install hotlane
+# or: brew install StefanIancu/hotlane/hotlane  |  npm install -g hotlane  |  pip install hotlane
 
 cd your-app
 hotlane init      # detects Node / Python / Go, writes hotlane.yml

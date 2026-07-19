@@ -22,6 +22,20 @@ archives:
 checksum:
   name_template: checksums.txt
 
+brews:
+  - name: hotlane
+    repository:
+      owner: StefanIancu
+      name: homebrew-hotlane
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://hotlane.dev
+    description: "Instant verified deploys: fork the live app, verify, flip traffic"
+    license: MIT
+    install: bin.install "hotlane"
+    test: |
+      assert_match "hotlane", shell_output("#{bin}/hotlane version")
+
 changelog:
   use: github
   filters:
