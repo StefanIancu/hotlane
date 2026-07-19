@@ -77,6 +77,8 @@ func main() {
 		cmdRollback(os.Args[2:])
 	case "drift":
 		cmdDrift(os.Args[2:])
+	case "mcp":
+		cmdMCP(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("hotlane", version)
 	default:
@@ -100,7 +102,10 @@ commands:
   rollback  flip the proxy to a previous version
   logs      tail the live version's output
   drift     cold-boot the clean image and diff its behavior against live
+  mcp       serve hotlane as MCP tools over stdio (for AI agents)
   version   print version
+
+most commands accept -json for machine-readable output
 
 environment:
   HOTLANE_DAEMON  default daemon URL for client commands (default http://127.0.0.1:7433)
@@ -231,6 +236,25 @@ func cmdServe(args []string) {
 		method, path, _ := strings.Cut(pattern, " ")
 		mux.HandleFunc(method+" /-"+path, h)
 	}
+	handle("GET /v1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"service": "hotlane",
+			"version": version,
+			"docs":    "https://hotlane.dev/llms-full.txt",
+			"routes": []string{
+				"GET  /-/healthz              liveness (no auth)",
+				"GET  /-/v1/status            live version, ring, held forks, archive/drift, baseline_commit",
+				"POST /-/v1/push              body=raw git diff -> fork, verify, promote; 422 on rejection",
+				"POST /-/v1/test              body=raw git diff -> fork, verify, HOLD; returns X-Hotlane-Fork header",
+				"POST /-/v1/promote           {version} -> flip traffic to a held fork",
+				"POST /-/v1/discard           {version} -> destroy a held fork",
+				"POST /-/v1/rollback          {version?} -> flip to a kept version",
+				"POST /-/v1/drift-check       cold-boot clean image, diff behavior vs live",
+				"GET  /-/v1/logs?tail=N       live container output",
+			},
+		})
+	})
 	handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok app=%s version=%s\n", cfg.App, version)
 	})
@@ -546,17 +570,21 @@ func cmdLogs(args []string) {
 	os.Stdout.Write(body)
 }
 
-// computeDiff builds the delta to send: from the daemon's baseline
+// computeDiffE builds the delta to send: from the daemon's baseline
 // commit (or an explicit ref) to the working tree.
-func computeDiff(daemon, from string) []byte {
+func computeDiffE(daemon, from string) ([]byte, error) {
 	base := from
 	if base == "" {
-		base = daemonBaseline(daemon)
+		b, err := daemonBaselineE(daemon)
+		if err != nil {
+			return nil, err
+		}
+		base = b
 	}
 	diffArgs := []string{"diff", "HEAD", "--relative"}
 	if base != "" {
 		if exec.Command("git", "cat-file", "-e", base+"^{commit}").Run() != nil {
-			log.Fatalf("hotlane: baseline commit %.12s is not in this clone.\nCI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists.", base)
+			return nil, fmt.Errorf("baseline commit %.12s is not in this clone - CI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists", base)
 		}
 		diffArgs = []string{"diff", base, "--relative"}
 	}
@@ -564,7 +592,16 @@ func computeDiff(daemon, from string) []byte {
 	diffCmd.Stderr = os.Stderr
 	diff, err := diffCmd.Output()
 	if err != nil {
-		log.Fatalf("hotlane: git diff: %v", err)
+		return nil, fmt.Errorf("git diff: %w", err)
+	}
+	return diff, nil
+}
+
+// computeDiff is computeDiffE with CLI ergonomics (fatal on error).
+func computeDiff(daemon, from string) []byte {
+	diff, err := computeDiffE(daemon, from)
+	if err != nil {
+		log.Fatalf("hotlane: %v", err)
 	}
 	if len(bytes.TrimSpace(diff)) == 0 {
 		log.Printf("hotlane: no changes vs the daemon's baseline; forking current state anyway")
@@ -583,6 +620,7 @@ func cmdPush(args []string) {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	from := fs.String("from", "", "git ref to diff from (default: dirty worktree diffs HEAD, clean worktree diffs the daemon's baseline commit)")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
 	diff := computeDiff(*daemon, *from)
@@ -593,6 +631,13 @@ func cmdPush(args []string) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Println(string(bytes.TrimSpace(body)))
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 
 	var res pushResponse
 	if err := json.Unmarshal(body, &res); err != nil {
@@ -632,6 +677,7 @@ func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
 	from := fs.String("from", "", "git ref to diff from (default: the daemon's baseline commit)")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
 	diff := computeDiff(*daemon, *from)
@@ -641,6 +687,13 @@ func cmdTest(args []string) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Println(string(bytes.TrimSpace(body)))
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 
 	var out struct {
 		Fork      pushResponse `json:"fork"`
@@ -677,6 +730,7 @@ func cmdTest(args []string) {
 func cmdPromote(args []string) {
 	fs := flag.NewFlagSet("promote", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		log.Fatal("usage: hotlane promote <version>")
@@ -692,6 +746,13 @@ func cmdPromote(args []string) {
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Println(string(bytes.TrimSpace(out)))
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Fatalf("hotlane promote: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
 	}
@@ -701,6 +762,7 @@ func cmdPromote(args []string) {
 func cmdDiscard(args []string) {
 	fs := flag.NewFlagSet("discard", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		log.Fatal("usage: hotlane discard <version>")
@@ -716,6 +778,14 @@ func cmdDiscard(args []string) {
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		if resp.StatusCode == http.StatusNoContent {
+			fmt.Printf("{\"discarded\":%d}\n", v)
+			return
+		}
+		fmt.Println(string(bytes.TrimSpace(out)))
+		os.Exit(1)
+	}
 	if resp.StatusCode != http.StatusNoContent {
 		log.Fatalf("hotlane discard: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
 	}
@@ -725,7 +795,22 @@ func cmdDiscard(args []string) {
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
+
+	if *jsonOut {
+		resp, err := apiRequest("GET", *daemon+"/-/v1/status", "", nil)
+		if err != nil {
+			log.Fatalf("hotlane status: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Println(string(bytes.TrimSpace(body)))
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 
 	var st struct {
 		App      string           `json:"app"`
@@ -768,6 +853,7 @@ func cmdStatus(args []string) {
 func cmdDrift(args []string) {
 	fs := flag.NewFlagSet("drift", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
 	resp, err := apiRequest("POST", *daemon+"/-/v1/drift-check", "application/json", nil)
@@ -776,6 +862,14 @@ func cmdDrift(args []string) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Println(string(bytes.TrimSpace(body)))
+		var st archive.Status
+		if json.Unmarshal(body, &st) == nil && st.Drift == archive.DriftDrifted {
+			os.Exit(1)
+		}
+		return
+	}
 	var st archive.Status
 	if err := json.Unmarshal(body, &st); err != nil {
 		log.Fatalf("hotlane drift: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
@@ -792,6 +886,7 @@ func cmdDrift(args []string) {
 func cmdRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
 	daemon := fs.String("daemon", daemonDefault(), "daemon API base URL")
+	jsonOut := fs.Bool("json", false, "print the daemon's raw JSON response")
 	fs.Parse(args)
 
 	req := struct {
@@ -811,6 +906,13 @@ func cmdRollback(args []string) {
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Println(string(bytes.TrimSpace(out)))
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Fatalf("hotlane rollback: daemon: %s: %s", resp.Status, bytes.TrimSpace(out))
 	}
@@ -832,23 +934,23 @@ func worktreeDirty() bool {
 	return err != nil || len(bytes.TrimSpace(out)) > 0
 }
 
-// daemonBaseline asks the daemon which commit its pristine snapshot was
-// taken at. Empty when unknown (non-git source or unreachable field).
-func daemonBaseline(daemon string) string {
+// daemonBaselineE asks the daemon which commit its pristine snapshot
+// was taken at. Empty when unknown (non-git source dir).
+func daemonBaselineE(daemon string) (string, error) {
 	var st struct {
 		BaselineCommit string `json:"baseline_commit"`
 	}
 	resp, err := apiRequest("GET", daemon+"/-/v1/status", "", nil)
 	if err != nil {
-		log.Fatalf("hotlane push: %v", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("hotlane push: daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
+		return "", fmt.Errorf("daemon: %s: %s", resp.Status, bytes.TrimSpace(body))
 	}
 	json.Unmarshal(body, &st)
-	return st.BaselineCommit
+	return st.BaselineCommit, nil
 }
 
 func getJSON(url string, v any) {

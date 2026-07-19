@@ -112,7 +112,11 @@ hotlane rollback [n] # flip to the previous (or a specific) kept version
 hotlane status       # live version, ring, drift verdict, timings
 hotlane logs [-n N]  # tail the live version's output
 hotlane drift        # cold-boot the clean image, diff behavior vs live; exit 1 on drift
+hotlane mcp          # serve hotlane as MCP tools over stdio - agents get push/test/
+                     #   promote/rollback natively, no shell parsing
 ```
+
+Every state-touching command accepts `-json` for machine-readable output. The daemon API is self-describing (`GET /-/v1`), and agents can read the complete operating contract in one fetch: [hotlane.dev/llms-full.txt](https://hotlane.dev/llms-full.txt).
 
 Client commands read `HOTLANE_DAEMON` and send `HOTLANE_TOKEN` as a bearer token. With `serve -tls-domain yourapp.example.com`, the daemon does its own HTTPS via Let's Encrypt and shares :443 the way humans expect: **your app is served at `https://yourapp.example.com/` with TLS included**, the API tucks under the reserved `/-/` prefix, and port 80 redirects. CI deploys with two secrets and one command ([full guide](docs/ci.md)).
 
