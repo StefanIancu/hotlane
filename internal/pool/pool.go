@@ -144,6 +144,12 @@ func (p *Pool) adopt(name string) error {
 	if h := p.highestVersion(); h >= p.next {
 		p.next = h + 1
 	}
+	// The persisted counter outlives every container, so a reaped fork
+	// or a pruned ring entry cannot hand its number out twice.
+	if n := p.recordedNext(); n > p.next {
+		p.next = n
+	}
+	p.recordNext(p.next)
 	log.Printf("pool: adopted %s (v%d) at %s, next version v%d", name, version, addr, p.next)
 	return nil
 }
@@ -202,6 +208,7 @@ func (p *Pool) createBaseline() error {
 	}
 	p.Live, p.Backend, p.Version = name, addr, version
 	p.next = version + 1
+	p.recordNext(p.next)
 	log.Printf("pool: baseline %s ready at %s", name, addr)
 	return nil
 }
@@ -224,6 +231,7 @@ func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	start := time.Now()
 	res := &ForkResult{Version: p.next}
 	p.next++
+	p.recordNext(p.next)
 	name := containerName(p.Cfg.App, res.Version)
 	res.Container = name
 
@@ -669,6 +677,29 @@ func (p *Pool) State() State {
 		LastFork: p.LastFork,
 		Baseline: p.BaselineCommit,
 	}
+}
+
+// nextMarker persists the version counter. Deriving it from surviving
+// containers is not enough: reaping a held fork, discarding a rejected
+// push, or pruning the ring all lower the maximum, and the counter then
+// hands out a number that was already used. Versions are an audit
+// trail - the archivist tags registry images <ref>:vN - so reuse
+// silently overwrites the image for a different build.
+func (p *Pool) nextMarker() string { return filepath.Join(p.DataDir, "next-version") }
+
+func (p *Pool) recordNext(v int) {
+	if err := os.WriteFile(p.nextMarker(), []byte(strconv.Itoa(v)), 0o644); err != nil {
+		log.Printf("pool: recording next version: %v", err)
+	}
+}
+
+func (p *Pool) recordedNext() int {
+	b, err := os.ReadFile(p.nextMarker())
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return v
 }
 
 // liveMarker records which container this daemon last flipped traffic
