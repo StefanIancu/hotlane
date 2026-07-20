@@ -329,12 +329,22 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 	// Shadow testing: replay recorded live traffic at the verified fork
 	// before it takes over. gate mode treats a mismatch exactly like a
 	// failing verify hook; report mode promotes and tells the truth.
-	if out.Replay = a.runReplay(res.Backend); out.Replay != nil && out.Replay.Mismatched > 0 {
+	// An INCOMPLETE run is not a clean one. Budget-expired entries count
+	// as neither matched nor mismatched, so a fork that hangs answers
+	// nothing, scores zero mismatches, and would otherwise walk straight
+	// through the gate that exists to stop exactly that.
+	if out.Replay = a.runReplay(res.Backend); out.Replay != nil && (out.Replay.Mismatched > 0 || out.Replay.Incomplete()) {
 		// Endpoint(), not Path: this goes to the webhook, and recorded
 		// query strings carry user tokens and email addresses.
-		detail := fmt.Sprintf("v%d: %d/%d replayed requests answered differently (e.g. %s)",
-			res.Version, out.Replay.Mismatched, out.Replay.Replayed,
-			out.Replay.Mismatches[0].Endpoint())
+		detail := fmt.Sprintf("v%d: %d/%d replayed requests answered differently",
+			res.Version, out.Replay.Mismatched, out.Replay.Replayed)
+		if len(out.Replay.Mismatches) > 0 {
+			detail += " (e.g. " + out.Replay.Mismatches[0].Endpoint() + ")"
+		}
+		if out.Replay.Incomplete() {
+			detail += fmt.Sprintf(" [only %d of %d judged before the budget expired]",
+				out.Replay.Replayed, out.Replay.Buffered)
+		}
 		a.notif.Send(notify.EventReplayMismatch, detail)
 		if a.cfg.Replay.Gate() {
 			out.Promoted = false

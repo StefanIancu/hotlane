@@ -427,3 +427,29 @@ func TestRunFlagsResponseHeaderChanges(t *testing.T) {
 		t.Errorf("redirect target change not flagged (empty bodies match): %+v", res2)
 	}
 }
+
+// A fork that answers nothing produces ZERO mismatches, because
+// budget-expired entries count as neither matched nor mismatched. The
+// gate must therefore consult Incomplete(), not just Mismatched - this
+// asserts the signal exists and is set, so a gate built on it cannot
+// silently pass a hung fork.
+func TestHungForkReportsIncompleteNotClean(t *testing.T) {
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") },
+		"/1", "/2", "/3", "/4", "/5", "/6")
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(10 * time.Second) // never answers within the budget
+	}))
+	defer hung.Close()
+
+	res := Run(b.Snapshot(6), b.Len(), strings.TrimPrefix(hung.URL, "http://"), 800*time.Millisecond)
+	if res.Mismatched != 0 {
+		t.Logf("note: %d mismatches recorded", res.Mismatched)
+	}
+	if !res.Incomplete() {
+		t.Fatalf("a fork that answered nothing did not report Incomplete: %+v", res)
+	}
+	if res.Mismatched == 0 && !res.Incomplete() {
+		t.Fatal("hung fork looks identical to a clean run - gate mode would promote it")
+	}
+}
