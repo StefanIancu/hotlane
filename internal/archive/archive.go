@@ -22,6 +22,7 @@ import (
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/docker"
 	"github.com/StefanIancu/hotlane/internal/notify"
+	"github.com/StefanIancu/hotlane/internal/replay"
 	"github.com/StefanIancu/hotlane/internal/respdiff"
 	"github.com/StefanIancu/hotlane/internal/verify"
 )
@@ -48,6 +49,11 @@ type Archivist struct {
 	Cfg      *config.Config
 	DataDir  string
 	Notifier *notify.Notifier
+	// ReplayEntries supplies the recorded live-traffic slice (entries +
+	// buffered count) for drift checks; nil when replay is off. Phase 2
+	// of docs/traffic-replay.md: the cold boot must answer the traffic
+	// users actually sent, not just the paths named in verify hooks.
+	ReplayEntries func() ([]replay.Entry, int)
 
 	mu             sync.Mutex
 	status         Status
@@ -240,6 +246,9 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 			}
 		} else if diff := compareResponses(a.Cfg, addr, liveBackend); diff != "" {
 			detail = diff
+		} else if a.ReplayEntries != nil {
+			entries, buffered := a.ReplayEntries()
+			detail = replayDrift(entries, buffered, addr, a.Cfg.Replay.BudgetOrDefault())
 		}
 	}
 	docker.Remove(name)
@@ -266,6 +275,27 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 		a.Notifier.Send(notify.EventDriftHealed, "")
 	}
 	return a.status
+}
+
+// replayDrift replays the recorded live slice against the cold boot:
+// behavioral drift coverage across the endpoints users actually
+// exercise, not just the ones named in config. Returns "" when the cold
+// boot answers recent real traffic the way live did.
+func replayDrift(entries []replay.Entry, buffered int, coldAddr string, budget time.Duration) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	res := replay.Run(entries, buffered, coldAddr, budget)
+	if res.Mismatched == 0 {
+		return ""
+	}
+	m := res.Mismatches[0]
+	if m.WantStatus != m.GotStatus && m.GotStatus != 0 {
+		return fmt.Sprintf("replayed traffic differs on %s %s: live answered %d, clean build answers %d (%d/%d replayed requests differ)",
+			m.Method, m.Path, m.WantStatus, m.GotStatus, res.Mismatched, res.Replayed)
+	}
+	return fmt.Sprintf("replayed traffic differs on %s %s: live served %q, clean build serves %q (%d/%d replayed requests differ)",
+		m.Method, m.Path, m.Want, m.Got, res.Mismatched, res.Replayed)
 }
 
 // compareResponses diffs the behavior of every http verify hook path

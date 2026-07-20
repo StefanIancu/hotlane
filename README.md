@@ -156,7 +156,7 @@ DRIFTED: behavior differs on /: clean build serves "hello", live serves "TAMPERE
 next push will rebuild from hotlane-api:clean
 ```
 
-The comparison is behavior-based and tolerant of dynamic content: timestamps, UUIDs, request ids and the like are masked, and anything that differs between two requests to the *same* instance is excluded as evidence (status codes always compare) - so a `/health` that reports uptime doesn't cry wolf. Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. The clean image also keeps the fast lane sustainable: fork chains auto-rebase onto it every ~40 pushes, so agent-speed pushing never hits Docker's layer-depth limit. Fast lane and audit trail, both real.
+The comparison is behavior-based and tolerant of dynamic content: timestamps, UUIDs, request ids and the like are masked, and anything that differs between two requests to the *same* instance is excluded as evidence (status codes always compare) - so a `/health` that reports uptime doesn't cry wolf. With `replay:` enabled, drift checks also replay the recorded traffic slice against the cold boot - divergence is caught on any endpoint users recently exercised, not just the paths named in hooks. Divergence pings your webhook (Slack/Discord native), and the next ordinary push rebuilds from the clean image - the chain heals itself. The clean image also keeps the fast lane sustainable: fork chains auto-rebase onto it every ~40 pushes, so agent-speed pushing never hits Docker's layer-depth limit. Fast lane and audit trail, both real.
 
 ## Built for agent loops
 

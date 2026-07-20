@@ -63,6 +63,17 @@ func (b *Buffer) add(e Entry) {
 	}
 }
 
+// Reset empties the buffer. Call on every traffic flip (promote,
+// rollback): recorded exchanges describe the version that was serving
+// when they were captured, and replaying them against a successor's
+// fork - or a drift check's cold boot - would compare the future
+// against a stale past and false-positive.
+func (b *Buffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.next, b.full = 0, false
+}
+
 // Len is how many exchanges are currently buffered.
 func (b *Buffer) Len() int {
 	b.mu.Lock()

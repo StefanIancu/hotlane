@@ -71,6 +71,9 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 	a.arch = archive.New(cfg, a.pool.DataDir, a.notif)
 	if cfg.Replay.Enabled() {
 		a.buffer = replay.NewBuffer(0)
+		a.arch.ReplayEntries = func() ([]replay.Entry, int) {
+			return a.buffer.Snapshot(cfg.Replay.Last), a.buffer.Len()
+		}
 	}
 	// First boot: snapshot the checkout so a clean image exists from day
 	// one. Restarts keep the existing snapshot - it holds the last
@@ -125,6 +128,14 @@ func (a *appRuntime) trafficHandler() http.Handler {
 		}
 		live.ServeHTTP(w, r)
 	})
+}
+
+// resetBuffer drops the recorded slice on any traffic flip - see
+// replay.Buffer.Reset for why stale recordings are poison.
+func (a *appRuntime) resetBuffer() {
+	if a.buffer != nil {
+		a.buffer.Reset()
+	}
 }
 
 // runReplay replays the buffered live slice against a verified fork.
@@ -235,6 +246,7 @@ func (a *appRuntime) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.front.Set(res.Backend)
+	a.resetBuffer() // recorded traffic described the version rolled away from
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
 }
@@ -294,6 +306,7 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	a.pool.Promote(res)
 	a.front.Set(res.Backend)
+	a.resetBuffer() // recorded traffic described the previous version
 	if err := a.arch.Snapshot(a.pool.ShadowDir()); err != nil {
 		log.Printf("push: archive snapshot: %v", err)
 	} else {
@@ -370,6 +383,7 @@ func (a *appRuntime) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.front.Set(res.Backend)
+	a.resetBuffer() // recorded traffic described the previous version
 	if err := a.arch.Snapshot(srcDir); err != nil {
 		log.Printf("promote: archive snapshot: %v", err)
 	} else {

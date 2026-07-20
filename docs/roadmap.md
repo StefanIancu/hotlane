@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-07-19 (v0.6.0).
+Last updated: 2026-07-20 (v0.6.1).
 
 ## Shipped
 
@@ -19,6 +19,8 @@ Last updated: 2026-07-19 (v0.6.0).
 **v0.5** - multi-app daemons ([design](multi-app.md)): `serve -apps /etc/hotlane/apps/` runs every config in the directory behind shared listeners. Host-header routing with an explicit 421 (never a fall-through to another app), per-app rings/archivists/held forks, the `/-/v1/apps/<app>/` API namespace (bare paths stay full aliases on single-app daemons - zero client breakage), `-tls` with one Let's Encrypt cert per `domain:`, a global clean-build semaphore, `status -all`, and app selection for clients via `-app` / `HOTLANE_APP` / the local hotlane.yml. Static by design: the set of apps is what's on disk.
 
 **v0.6** - traffic-replay verification ([design](traffic-replay.md)): shadow testing built into the deploy. The proxy records a rolling in-memory slice of live traffic (with the responses live served); every push replays it against the verified fork and diffs the answers via the drift normalizer, self-dynamic paths comparing status only. `mode: report` annotates the push and pings the webhook; `mode: gate` rejects a mismatch exactly like a failing verify hook. Reads-only by default, memory-only buffer, and `hotlane test` holds carry the report for agents to read before promoting.
+
+**v0.6.1** - replay phase 2: drift checks replay the recorded slice against the cold boot, so behavioral drift is caught on any endpoint users recently exercised, not just verify-hook paths. Plus the buffer-lifecycle fix phase 2 forced into the open: every traffic flip resets the buffer (recorded exchanges describe the version that served them; replaying them against a successor false-positives - the second of two rapid pushes hit exactly this).
 
 ## Next
 

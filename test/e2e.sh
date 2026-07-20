@@ -202,6 +202,25 @@ echo "$OUT" | grep -q "REJECTED" || fail "no REJECTED in gate output: $OUT"
 expect_body "http://$PROXY/" "howdy from demo-app v5"
 git checkout -q message.txt
 
+step "replay phase 2: drift check catches tampering on a path no hook names"
+wait_archive 9 || fail "archive never caught up to v9 before the phase-2 drift check"
+pkill -x hotlane; sleep 2
+# Hooks watch ONLY /health; "/" is invisible to hook-path comparison.
+python3 - <<'EOF'
+import re
+s = open("hotlane.yml").read()
+s = re.sub(r"verify:.*?(?=^\S)", "verify:\n  - http: /health == 200\n", s, flags=re.S | re.M)
+open("hotlane.yml", "w").write(s)
+EOF
+git commit -qam "hooks: health only"
+"$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 30 || fail "phase-2 daemon never came up"
+LIVE=$(curl -s -H "Authorization: Bearer supersecret" "http://$API/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['live'])")
+docker exec "$LIVE" sh -c 'echo TAMPERED > /app/message.txt'
+for _ in $(seq 1 6); do curl -s "http://$PROXY/" >/dev/null; done   # users now see the tampered page
+if OUT="$(HOTLANE_TOKEN=supersecret "$BIN" drift 2>&1)"; then fail "phase-2 drift not detected: $OUT"; fi
+echo "$OUT" | grep -q "replayed traffic differs on GET /" || fail "drift not attributed to replayed traffic: $OUT"
+
 step "multi-app: two apps from one -apps dir, host-routed"
 pkill -x hotlane; sleep 2
 MAPPS="$TMP/apps"; mkdir -p "$MAPPS"

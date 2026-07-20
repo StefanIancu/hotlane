@@ -152,6 +152,21 @@ func TestRunToleratesTimestamps(t *testing.T) {
 	}
 }
 
+func TestResetEmptiesAndRefills(t *testing.T) {
+	b := NewBuffer(3)
+	for i := 0; i < 5; i++ {
+		b.add(Entry{Path: fmt.Sprintf("/%d", i)})
+	}
+	b.Reset()
+	if b.Len() != 0 || len(b.Snapshot(3)) != 0 {
+		t.Fatalf("reset left %d entries", b.Len())
+	}
+	b.add(Entry{Path: "/new"})
+	if b.Len() != 1 || b.Snapshot(1)[0].Path != "/new" {
+		t.Errorf("refill after reset broken: len=%d", b.Len())
+	}
+}
+
 func TestCaptureAndReplayBodiedRequest(t *testing.T) {
 	// The POST opt-in: the request body must be tee'd at capture and
 	// faithfully re-sent at replay.

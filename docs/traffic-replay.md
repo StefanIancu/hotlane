@@ -1,9 +1,13 @@
 # Design sketch: traffic-replay verification
 
-Status: shipped in v0.6.0 as sketched (phase 2 - replaying the slice in
-drift checks - still open). Measured capture overhead on the live path:
-~1&micro;s/request (480ns bare vs 1.45&micro;s captured, BenchmarkCapture) -
-noise against millisecond-scale request handling.
+Status: shipped in v0.6.0 as sketched; phase 2 (the slice in drift
+checks) shipped in v0.6.1, which also fixed a phase-1 latency bug in the
+model itself: recorded exchanges describe the version that served them,
+so EVERY traffic flip (promote, held-promote, rollback) now resets the
+buffer - without that, the second of two rapid pushes replayed stale
+expectations and false-positived. Measured capture overhead on the live
+path: ~1&micro;s/request (480ns bare vs 1.45&micro;s captured,
+BenchmarkCapture) - noise against millisecond-scale request handling.
 
 ## Problem
 

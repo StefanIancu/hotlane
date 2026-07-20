@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/StefanIancu/hotlane/internal/config"
+	"github.com/StefanIancu/hotlane/internal/replay"
 )
 
 // serve returns an httptest server whose body comes from fn on each request.
@@ -70,6 +72,51 @@ func TestCompareSkipsSelfDynamicBody(t *testing.T) {
 	defer live.Close()
 	if d := compareResponses(cfgWith("/"), addr(cold), addr(live)); d != "" {
 		t.Errorf("self-dynamic body read as drift: %s", d)
+	}
+}
+
+// recordVia drives requests through a replay.Capture server to build a
+// realistic recorded slice.
+func recordVia(t *testing.T, h http.HandlerFunc, paths ...string) []replay.Entry {
+	t.Helper()
+	b := replay.NewBuffer(16)
+	srv := httptest.NewServer(replay.Capture(h, b, map[string]bool{"GET": true}, nil))
+	defer srv.Close()
+	for _, p := range paths {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	return b.Snapshot(len(paths))
+}
+
+func TestReplayDriftCleanWhenColdMatchesRecorded(t *testing.T) {
+	h := func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "page %s", r.URL.Path) }
+	entries := recordVia(t, h, "/a", "/b")
+	cold := httptest.NewServer(http.HandlerFunc(h))
+	defer cold.Close()
+	if d := replayDrift(entries, len(entries), addr(cold), time.Second); d != "" {
+		t.Errorf("unexpected drift: %s", d)
+	}
+}
+
+func TestReplayDriftFlagsNonHookPathDivergence(t *testing.T) {
+	// The phase-2 point: a path no verify hook names, but users hit it -
+	// the cold boot answering it differently IS drift.
+	entries := recordVia(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "live truth") }, "/unhooked")
+	cold := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "TAMPERED") }))
+	defer cold.Close()
+	d := replayDrift(entries, 1, addr(cold), time.Second)
+	if !strings.Contains(d, "replayed traffic differs on GET /unhooked") {
+		t.Errorf("divergence not flagged: %q", d)
+	}
+}
+
+func TestReplayDriftEmptySliceIsClean(t *testing.T) {
+	if d := replayDrift(nil, 0, "127.0.0.1:1", time.Second); d != "" {
+		t.Errorf("empty slice produced drift: %q", d)
 	}
 }
 
