@@ -135,6 +135,11 @@ func (p *Pool) adopt(name string) error {
 		return fmt.Errorf("adopting %s: %w", name, err)
 	}
 	p.Live, p.Backend, p.Version = name, addr, version
+	// Record the adoption: the fallback path (newest running container)
+	// can pick a container the marker never named, and the live history
+	// must list everything that served - the orphan reaper destroys
+	// running containers it has never heard of.
+	p.recordLive(name)
 	// Versions are never reused, so the counter must clear every
 	// container that exists - not just the adopted one. After a rollback
 	// the live container is NOT the highest version (v4 is stopped in
@@ -207,6 +212,7 @@ func (p *Pool) createBaseline() error {
 		return fmt.Errorf("baseline %s: %w", name, err)
 	}
 	p.Live, p.Backend, p.Version = name, addr, version
+	p.recordLive(name)
 	p.next = version + 1
 	p.recordNext(p.next)
 	log.Printf("pool: baseline %s ready at %s", name, addr)
@@ -418,17 +424,24 @@ func versionFromName(name string) int {
 	return v
 }
 
-// prune removes the oldest non-live versions beyond the configured ring
-// size, containers and snapshot images both (unbounded version stacking is
-// how hosts run out of disk).
+// prune removes the least-recently-live versions beyond the configured
+// ring size, containers and snapshot images both (unbounded version
+// stacking is how hosts run out of disk). Retention follows the live
+// history, not version numbers: after a rollback the version that was
+// just serving is lower numbered than the one it displaced, and pruning
+// "lowest N" would destroy the only known-good rollback target while
+// keeping the bad build.
 func (p *Pool) prune() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	kept := 0
+	entries := make([]RingEntry, 0)
 	for _, e := range p.ring() {
-		if e.Live {
-			continue
+		if !e.Live {
+			entries = append(entries, e)
 		}
+	}
+	kept := 0
+	for _, e := range pruneOrder(entries, p.liveHistory()) {
 		if kept < p.Cfg.Ring {
 			kept++
 			continue
@@ -441,6 +454,29 @@ func (p *Pool) prune() {
 		// Best effort: v1 has no snapshot image (baseline runs on cfg.Image).
 		docker.RemoveImage(p.imageRef(e.Version))
 	}
+}
+
+// pruneOrder ranks ring entries by how recently they were live, most
+// recent first. Entries never recorded in the history (daemons upgraded
+// mid-ring) sort after all recorded ones, newest version first - the
+// pre-history behavior.
+func pruneOrder(entries []RingEntry, history []int) []RingEntry {
+	rank := make(map[int]int, len(history))
+	for i, v := range history {
+		rank[v] = i + 1 // 0 is reserved for "never recorded"
+	}
+	out := append([]RingEntry(nil), entries...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := rank[out[i].Version], rank[out[j].Version]
+		if ri > 0 && rj > 0 {
+			return ri < rj // both recorded: most recently live first
+		}
+		if ri != rj {
+			return ri > 0 // recorded beats never-recorded
+		}
+		return out[i].Version > out[j].Version
+	})
+	return out
 }
 
 // RollbackResult describes a completed rollback.
@@ -712,6 +748,52 @@ func (p *Pool) recordLive(name string) {
 	if err := os.WriteFile(p.liveMarker(), []byte(name), 0o644); err != nil {
 		log.Printf("pool: recording live container: %v", err)
 	}
+	if v := versionFromName(name); v > 0 {
+		p.recordHistory(v)
+	}
+}
+
+// historyMarker persists the order versions were live in, most recent
+// first, one version per line. Prune retains by this order, not by
+// version number: after a rollback the known-good version is LOWER
+// numbered than the bad one it displaced, and retaining "highest N"
+// would prune exactly the version worth keeping.
+func (p *Pool) historyMarker() string { return filepath.Join(p.DataDir, "live-history") }
+
+// maxHistory caps the history file; anything past it is long pruned.
+const maxHistory = 100
+
+func (p *Pool) recordHistory(version int) {
+	hist := append([]int{version}, p.liveHistory()...)
+	seen := make(map[int]bool, len(hist))
+	var b strings.Builder
+	kept := 0
+	for _, v := range hist {
+		if seen[v] || kept >= maxHistory {
+			continue
+		}
+		seen[v] = true
+		kept++
+		fmt.Fprintf(&b, "%d\n", v)
+	}
+	if err := os.WriteFile(p.historyMarker(), []byte(b.String()), 0o644); err != nil {
+		log.Printf("pool: recording live history: %v", err)
+	}
+}
+
+// liveHistory returns the recorded live order, most recent first.
+func (p *Pool) liveHistory() []int {
+	b, err := os.ReadFile(p.historyMarker())
+	if err != nil {
+		return nil
+	}
+	var hist []int
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && v > 0 {
+			hist = append(hist, v)
+		}
+	}
+	return hist
 }
 
 // recordedLive returns the last recorded live container if it still
@@ -738,7 +820,10 @@ func (p *Pool) recordedLive() string {
 // served traffic. Written when the fork is held, removed BEFORE promote
 // flips traffic to it - so a crash mid-promote leaves no marker and the
 // (verified, now-live) container is adopted normally, while a crash
-// while merely holding leaves the marker and the fork gets reaped.
+// while merely holding leaves the marker and the fork gets reaped. A
+// crash in the gap - marker gone, flip not yet made - leaves a running
+// fork with neither marker nor history entry; the orphan reaper in
+// reapHeldOnStart collects those.
 func (p *Pool) heldMarker(version int) string {
 	return filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d.held", version))
 }
@@ -771,6 +856,40 @@ func (p *Pool) reapHeldOnStart() {
 			docker.RemoveImage(p.imageRef(v))
 		}
 		os.Remove(m)
+		os.RemoveAll(filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", v)))
+	}
+
+	// A crash between held-marker removal and the traffic flip
+	// (PromoteHeld's window) leaves the fork RUNNING with no marker:
+	// not held, not live, never served - the marker loop above misses
+	// it and it pollutes the ring forever. A crash during a push's
+	// verify leaves the same signature. The live history lists every
+	// version that ever served, so any running container absent from
+	// it is such an orphan. An empty history means this daemon
+	// predates the record - skip rather than guess.
+	hist := p.liveHistory()
+	if len(hist) == 0 {
+		return
+	}
+	served := make(map[int]bool, len(hist))
+	for _, v := range hist {
+		served[v] = true
+	}
+	// Belt and braces: never touch the recorded live container, even if
+	// the history file was lost or hand-edited.
+	liveName := ""
+	if b, err := os.ReadFile(p.liveMarker()); err == nil {
+		liveName = strings.TrimSpace(string(b))
+	}
+	running, _ := docker.Running(p.Cfg.App)
+	for _, name := range running {
+		v := versionFromName(name)
+		if v == 0 || served[v] || name == liveName {
+			continue
+		}
+		log.Printf("pool: reaping orphaned fork %s (running but never served traffic - left by a crash)", name)
+		docker.Remove(name)
+		docker.RemoveImage(p.imageRef(v))
 		os.RemoveAll(filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", v)))
 	}
 }

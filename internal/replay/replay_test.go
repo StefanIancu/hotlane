@@ -133,6 +133,11 @@ func TestRunSelfDynamicComparesStatusOnly(t *testing.T) {
 	if res.Mismatched != 0 || res.Dynamic != 2 {
 		t.Errorf("res = %+v", res)
 	}
+	// The categories are disjoint (Replayed = Matched + Dynamic +
+	// Mismatched): a dynamic entry must not also count as Matched.
+	if res.Matched != 0 || res.Matched+res.Dynamic+res.Mismatched != res.Replayed {
+		t.Errorf("counts not disjoint: %+v", res)
+	}
 }
 
 func TestRunToleratesTimestamps(t *testing.T) {
@@ -451,5 +456,33 @@ func TestHungForkReportsIncompleteNotClean(t *testing.T) {
 	}
 	if res.Mismatched == 0 && !res.Incomplete() {
 		t.Fatal("hung fork looks identical to a clean run - gate mode would promote it")
+	}
+}
+
+func TestReplayPreservesRecordedHost(t *testing.T) {
+	// An app that echoes its Host header: recorded via the public
+	// hostname, replayed against the fork's loopback hostport. Without
+	// Host preservation the replay diff false-positives on every
+	// Host-derived byte (absolute URLs, tenant routing).
+	b := NewBuffer(4)
+	h := func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "host=%s", r.Host) }
+	srv := captureServer(b, map[string]bool{"GET": true}, nil, h)
+	defer srv.Close()
+	req, _ := http.NewRequest("GET", srv.URL+"/a", nil)
+	req.Host = "app.example.com"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if e := b.Snapshot(1)[0]; e.Host != "app.example.com" {
+		t.Fatalf("recorded host = %q, want app.example.com", e.Host)
+	}
+	fork := httptest.NewServer(http.HandlerFunc(h))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Replayed != 1 || res.Matched != 1 || res.Mismatched != 0 {
+		t.Errorf("res = %+v: fork saw a different Host than was recorded", res)
 	}
 }

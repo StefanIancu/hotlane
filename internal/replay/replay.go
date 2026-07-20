@@ -33,6 +33,12 @@ const bodyCap = 64 << 10
 type Entry struct {
 	Method string
 	Path   string // includes query string
+	// Host is the Host header as the client sent it. net/http promotes
+	// it out of r.Header into r.Host, so cloning the header map alone
+	// loses it - and a replayed request would then carry the fork's
+	// loopback host:port, changing behavior for any app that reads Host
+	// (absolute URLs, tenant routing).
+	Host   string
 	Header http.Header
 	Body   []byte
 
@@ -197,6 +203,7 @@ func Capture(next http.Handler, b *Buffer, methods map[string]bool, exclude []st
 		b.add(Entry{
 			Method:       r.Method,
 			Path:         r.URL.RequestURI(),
+			Host:         r.Host,
 			Header:       r.Header.Clone(),
 			Body:         append([]byte(nil), reqBody.Bytes()...),
 			Status:       rec.status,
@@ -267,10 +274,14 @@ func (m Mismatch) Endpoint() string {
 func (r *Result) Incomplete() bool { return r.BudgetHit }
 
 // Result is one replay run's verdict, attached to push/test responses.
+// The categories are disjoint: Replayed = Matched + Dynamic + Mismatched.
+// A self-dynamic entry whose status agrees counts as Dynamic only, never
+// Matched - agents sum these numbers, and a total exceeding Replayed
+// reads as broken arithmetic.
 type Result struct {
 	Replayed   int        `json:"replayed"`
-	Matched    int        `json:"matched"`
-	Dynamic    int        `json:"dynamic"` // status-only paths (self-dynamic in the buffer)
+	Matched    int        `json:"matched"` // fully compared, agreed
+	Dynamic    int        `json:"dynamic"` // status-only paths (self-dynamic in the buffer), status agreed
 	Mismatched int        `json:"mismatched"`
 	Buffered   int        `json:"buffered"`
 	BudgetHit  bool       `json:"budget_hit,omitempty"`
@@ -334,7 +345,6 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 			}
 		case v.dyn:
 			res.Dynamic++
-			res.Matched++
 		default:
 			res.Matched++
 		}
@@ -359,6 +369,9 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 		return v
 	}
 	req.Header = e.Header.Clone()
+	if e.Host != "" {
+		req.Host = e.Host // replay the Host the client sent, not the fork's hostport
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {

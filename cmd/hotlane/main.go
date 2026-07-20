@@ -207,12 +207,25 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "hotlane.yml", "path to hotlane.yml")
 	appsDir := fs.String("apps", "", "directory of app configs (*.yml): serve every app in it, routing traffic by Host header")
-	apiAddr := fs.String("addr", ":7433", "daemon API listen address")
+	apiAddr := fs.String("addr", "", "daemon API listen address (default 127.0.0.1:7433, or :7433 when a token is set)")
 	proxyAddr := fs.String("proxy", ":7480", "app traffic listen address")
 	token := fs.String("token", os.Getenv("HOTLANE_TOKEN"), "bearer token required on the API (empty = open; keep the API loopback-only then)")
 	tlsDomain := fs.String("tls-domain", "", "single-app: serve shared HTTPS on :443 with a Let's Encrypt certificate for this domain (requires -token; shorthand for domain: in the config plus -tls)")
 	tlsOn := fs.Bool("tls", false, "serve shared HTTPS on :443 with Let's Encrypt certificates for every configured domain: (requires -token)")
 	fs.Parse(args)
+
+	// The default bind follows the token: without one, loopback - so the
+	// quickstart (`hotlane init` then `hotlane serve`) works untokened and
+	// safe instead of dying on the exposure check below. With a token the
+	// default stays all-interfaces, so existing tokened deployments (CI
+	// pushing to a VPS) keep their remote API across upgrades.
+	if *apiAddr == "" {
+		if *token == "" {
+			*apiAddr = "127.0.0.1:7433"
+		} else {
+			*apiAddr = ":7433"
+		}
+	}
 
 	if *appsDir != "" && *tlsDomain != "" {
 		log.Fatal("hotlane: -tls-domain is single-app shorthand; with -apps, set domain: in each config and use -tls")
@@ -227,8 +240,8 @@ func cmdServe(args []string) {
 	if *token == "" && !loopbackOnly(*apiAddr) {
 		log.Fatalf("hotlane: -addr %q binds beyond loopback and no -token is set - that would expose an\n"+
 			"unauthenticated deploy API (anyone who reaches it can run code on this host).\n"+
-			"  either: hotlane serve -addr 127.0.0.1:7433        (local only, no token needed)\n"+
-			"  or:     hotlane serve -token \"$(openssl rand -hex 24)\"", *apiAddr)
+			"  either: hotlane serve                             (default binds loopback, no token needed)\n"+
+			"  or:     hotlane serve -addr %s -token \"$(openssl rand -hex 24)\"", *apiAddr, *apiAddr)
 	}
 
 	// One config (traditional) or a directory of them (multi-app).
@@ -355,6 +368,17 @@ func cmdServe(args []string) {
 			},
 		})
 	})
+	// A browser landing on the API port's root gets directions, not a bare
+	// 404: the most common reason anyone is here is having opened the
+	// wrong listener. Static text, nothing app-specific, no auth needed.
+	rootHint := func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hotlane %s deploy API\n"+
+			"  endpoints: GET /-/v1\n"+
+			"  liveness:  GET /-/healthz\n"+
+			"your app is served on the proxy port (default :7480), not here\n", version)
+	}
+	mux.HandleFunc("GET /{$}", rootHint)
+	mux.HandleFunc("GET /-/{$}", rootHint)
 	handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		// No app-name enumeration on the one unauthenticated route.
 		if single {
@@ -412,8 +436,11 @@ func cmdServe(args []string) {
 		want := []byte("Bearer " + *token)
 		api = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got := []byte(r.Header.Get("Authorization"))
-			healthz := r.URL.Path == "/healthz" || r.URL.Path == "/-/healthz"
-			if !healthz && subtle.ConstantTimeCompare(got, want) != 1 {
+			// Liveness and the root directions are static, app-agnostic
+			// text: the only two routes that answer without a token.
+			open := r.URL.Path == "/healthz" || r.URL.Path == "/-/healthz" ||
+				r.URL.Path == "/" || r.URL.Path == "/-/"
+			if !open && subtle.ConstantTimeCompare(got, want) != 1 {
 				http.Error(w, "unauthorized (set HOTLANE_TOKEN)", http.StatusUnauthorized)
 				return
 			}
@@ -425,9 +452,9 @@ func cmdServe(args []string) {
 
 	go func() {
 		if single {
-			log.Printf("hotlane %s: app traffic on %s -> %s", version, *proxyAddr, apps[0].front.Target())
+			log.Printf("hotlane %s: your app: %s -> %s (this is the URL to open)", version, listenURL(*proxyAddr), apps[0].front.Target())
 		} else {
-			log.Printf("hotlane %s: app traffic on %s (%d apps, routed by Host)", version, *proxyAddr, len(apps))
+			log.Printf("hotlane %s: your apps: %s (%d apps, routed by Host header)", version, listenURL(*proxyAddr), len(apps))
 		}
 		log.Fatal(http.ListenAndServe(*proxyAddr, appTraffic))
 	}()
@@ -488,11 +515,26 @@ func cmdServe(args []string) {
 		}()
 	}
 	if single {
-		log.Printf("hotlane %s: API on %s (app=%q ring=%d)", version, *apiAddr, apps[0].cfg.App, apps[0].cfg.Ring)
+		log.Printf("hotlane %s: deploy API: %s/-/v1 (app=%q ring=%d)", version, listenURL(*apiAddr), apps[0].cfg.App, apps[0].cfg.Ring)
 	} else {
-		log.Printf("hotlane %s: API on %s (%d apps)", version, *apiAddr, len(apps))
+		log.Printf("hotlane %s: deploy API: %s/-/v1 (%d apps)", version, listenURL(*apiAddr), len(apps))
 	}
 	log.Fatal(http.ListenAndServe(*apiAddr, api))
+}
+
+// listenURL renders a listen address as the URL a human would open:
+// an all-interfaces bind (":7480", "0.0.0.0:7480") is reachable as
+// localhost from the machine running it, and a bare host:port in the
+// banner is exactly what sent people to the wrong listener.
+func listenURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // cmdLogs tails the live version's output through the daemon.
@@ -520,7 +562,10 @@ func printReplay(r *replay.Result) {
 	if r == nil || (r.Replayed == 0 && !r.BudgetHit) {
 		return
 	}
-	line := fmt.Sprintf("  replay %d/%d matched", r.Matched, r.Replayed)
+	// Matched, Dynamic and Mismatched are disjoint; the headline counts
+	// everything that agreed, the parenthetical says how many of those
+	// were compared on status alone.
+	line := fmt.Sprintf("  replay %d/%d matched", r.Matched+r.Dynamic, r.Replayed)
 	if r.Dynamic > 0 {
 		line += fmt.Sprintf(" (%d dynamic, status-only)", r.Dynamic)
 	}

@@ -7,12 +7,39 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 BIN="$TMP/hotlane"
 APP="$TMP/app"
-API="127.0.0.1:7433"
-PROXY="127.0.0.1:7480"
+# Deliberately NOT the default ports: a hotlane someone is dogfooding on
+# this machine would otherwise answer the suite's health checks (and get
+# pkilled for its trouble either way - see stop_daemons).
+API="127.0.0.1:17433"
+PROXY="127.0.0.1:17480"
+# Client commands default to the standard port; point them at the
+# suite's daemon. Scenario-local env prefixes (HOTLANE_TOKEN=... "$BIN"
+# push) compose fine with an exported variable.
+export HOTLANE_DAEMON="http://$API"
 DLOG="$TMP/daemon.log"
 
+# Every suite daemon carries -addr $API on its command line, so this
+# pattern kills suite daemons (this run's or a crashed previous run's
+# still holding the port) and never a hotlane someone is dogfooding.
+# No leading dash: pkill -f would parse it as an option and silently
+# kill nothing.
+KILLPAT="addr $API"
+
+# stop_daemons kills the suite's daemons and WAITS for them to die: a
+# daemon mid-archive-build can outlive SIGTERM by seconds, and a fixed
+# sleep let the old daemon answer the next scenario's first health check.
+stop_daemons() {
+  pkill -f "$KILLPAT" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    pgrep -f "$KILLPAT" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  pkill -9 -f "$KILLPAT" 2>/dev/null || true
+  sleep 1
+}
+
 cleanup() {
-  pkill -x hotlane 2>/dev/null || true
+  pkill -f "$KILLPAT" 2>/dev/null || true
   for app in demo alpha beta; do
     for c in $(docker ps -aq --filter label=hotlane.app=$app); do docker rm -f "$c" >/dev/null 2>&1 || true; done
     docker rm -f "hotlane-$app-drift" >/dev/null 2>&1 || true
@@ -146,7 +173,7 @@ step "auth: daemon restart adopts the live container, token gates the API"
 # re-snapshot the (now dirty) worktree - the archivist keeps the last
 # promoted source, or every post-restart drift check false-positives.
 echo "hello-dirty" > message.txt
-pkill -x hotlane; sleep 2
+stop_daemons
 HOTLANE_REBASE_DEPTH=1 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/" 200 30 || fail "adopt after restart failed"
 expect_body "http://$PROXY/" "hello from demo-app v4"
@@ -194,7 +221,7 @@ perl -pi -e 's/"v5b"/"vNEVERPROMOTED"/' server.js
 OUT="$(HOTLANE_TOKEN=supersecret "$BIN" test)" || fail "hold before restart failed: $OUT"
 HVR=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
 [ -n "$HVR" ] || fail "no held fork before restart: $OUT"
-pkill -x hotlane; sleep 2
+stop_daemons
 HOTLANE_REBASE_DEPTH=1 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/health" 200 60 || fail "daemon did not restart after holding a fork"
 wait_http "http://$API/healthz" 200 30 || fail "API did not come up after restart"
@@ -209,7 +236,7 @@ perl -pi -e 's/"vNEVERPROMOTED"/"v5b"/' server.js
 
 
 step "replay: buffer fills, report mode flags a content change but promotes"
-pkill -x hotlane; sleep 2
+stop_daemons
 printf 'replay:\n  last: 20\n' >> hotlane.yml
 git add hotlane.yml && git commit -qm "enable replay"
 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
@@ -228,7 +255,7 @@ expect_body "http://$PROXY/" "howdy from demo-app v5b"
 git commit -qam howdy   # align HEAD with the promoted source for the next dirty diff
 
 step "replay: gate mode rejects what verify hooks missed"
-pkill -x hotlane; sleep 2
+stop_daemons
 perl -pi -e 's/^  last: 20$/  last: 20\n  mode: gate/' hotlane.yml
 git commit -qam "gate replay"
 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
@@ -244,7 +271,7 @@ git checkout -q message.txt
 step "replay phase 2: drift check catches tampering on a path no hook names"
 LIVEV=$(HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 wait_archive "$LIVEV" || fail "archive never caught up to v$LIVEV before the phase-2 drift check"
-pkill -x hotlane; sleep 2
+stop_daemons
 # Hooks watch ONLY /health; "/" is invisible to hook-path comparison.
 python3 - <<'EOF'
 import re
@@ -266,7 +293,7 @@ step "rollback during an in-flight push is not undone by that push"
 # mutex before verify runs - so a rollback landing in a push's verify
 # window returned SUCCESS and was then silently reverted by that push's
 # promote. The operator kept serving the version they were escaping.
-pkill -x hotlane; sleep 2
+stop_daemons
 # Write the config explicitly rather than patching the inherited one:
 # earlier scenarios left replay in GATE mode, which would reject these
 # deliberate content changes and make the race untestable.
@@ -300,7 +327,7 @@ step "a held fork whose TTL expired cannot be promoted onto live"
 # The reaper ran unsynchronized with promote: if a TTL expired inside
 # PromoteHeld's verify window it destroyed the container, and promote
 # then pointed the public proxy at a port that no longer existed.
-pkill -x hotlane; sleep 2
+stop_daemons
 HOTLANE_HOLD_TTL=5s "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/health" 200 60 || fail "daemon did not start for the TTL scenario"
 wait_http "http://$API/healthz" 200 30 || fail "API did not come up"
@@ -338,7 +365,7 @@ wait_http "http://$PROXY/health" 200 10 || fail "app unreachable after the build
 git checkout -q hotlane.yml server.js 2>/dev/null || true
 
 step "multi-app: two apps from one -apps dir, host-routed"
-pkill -x hotlane; sleep 2
+stop_daemons
 MAPPS="$TMP/apps"; mkdir -p "$MAPPS"
 for app in alpha beta; do
   mkdir -p "$TMP/srv-$app"
