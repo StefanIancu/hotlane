@@ -97,6 +97,18 @@ func (p *Pool) Ensure() error {
 	// putting unpromoted, untested code in front of users on a restart.
 	// The held marker survives the daemon, so reap them before adopting.
 	p.reapHeldOnStart()
+	// Prefer the version this daemon last put live. "Newest running
+	// container" is only the live one after a PROMOTE; after a ROLLBACK
+	// the newest running container is the version being rolled away
+	// from, still inside its stop grace. Adopting that one succeeds and
+	// then Docker finishes stopping it - leaving the proxy pointed at a
+	// dead backend, permanently.
+	if name := p.recordedLive(); name != "" {
+		if err := p.adopt(name); err == nil {
+			return nil
+		}
+		log.Printf("pool: recorded live %s is not adoptable, falling back to the newest running container", name)
+	}
 	running, err := docker.Running(p.Cfg.App)
 	if err != nil {
 		return err
@@ -123,9 +135,33 @@ func (p *Pool) adopt(name string) error {
 		return fmt.Errorf("adopting %s: %w", name, err)
 	}
 	p.Live, p.Backend, p.Version = name, addr, version
+	// Versions are never reused, so the counter must clear every
+	// container that exists - not just the adopted one. After a rollback
+	// the live container is NOT the highest version (v4 is stopped in
+	// the ring while v3 serves), and resuming at live+1 would collide
+	// with v4's container name on the next push.
 	p.next = version + 1
-	log.Printf("pool: adopted %s (v%d) at %s", name, version, addr)
+	if h := p.highestVersion(); h >= p.next {
+		p.next = h + 1
+	}
+	log.Printf("pool: adopted %s (v%d) at %s, next version v%d", name, version, addr, p.next)
 	return nil
+}
+
+// highestVersion is the largest version number any container for this
+// app still carries, in any state.
+func (p *Pool) highestVersion() int {
+	infos, err := docker.All(p.Cfg.App)
+	if err != nil {
+		return 0
+	}
+	high := 0
+	for _, in := range infos {
+		if v := versionFromName(in.Name); v > high {
+			high = v
+		}
+	}
+	return high
 }
 
 func (p *Pool) createBaseline() error {
@@ -281,6 +317,7 @@ func (p *Pool) Promote(res *ForkResult) (old string) {
 	defer p.mu.Unlock()
 	old = p.Live
 	p.Live, p.Backend, p.Version = res.Container, res.Backend, res.Version
+	p.recordLive(res.Container)
 	if old != "" && old != res.Container {
 		p.stopAsync(old, p.prune)
 	}
@@ -343,6 +380,14 @@ func (p *Pool) ring() []RingEntry {
 	for _, in := range infos {
 		v := versionFromName(in.Name)
 		if v == 0 {
+			continue
+		}
+		// A held fork is a running, labelled container, but it is NOT a
+		// ring entry: it was never promoted and never served traffic.
+		// Leaving it here let `rollback` flip live traffic onto
+		// unverified code, and let prune force-remove a fork someone was
+		// still testing.
+		if _, held := p.held[v]; held {
 			continue
 		}
 		entries = append(entries, RingEntry{
@@ -455,6 +500,7 @@ func (p *Pool) Rollback(version int, ready func(container, backend string) error
 
 	old := p.Live
 	p.Live, p.Backend, p.Version = target.Container, addr, target.Version
+	p.recordLive(target.Container)
 	if old != "" {
 		p.stopAsync(old, nil)
 	}
@@ -623,6 +669,38 @@ func (p *Pool) State() State {
 		LastFork: p.LastFork,
 		Baseline: p.BaselineCommit,
 	}
+}
+
+// liveMarker records which container this daemon last flipped traffic
+// to, so a restart resumes the same one rather than guessing from
+// container state.
+func (p *Pool) liveMarker() string { return filepath.Join(p.DataDir, "live-container") }
+
+// recordLive persists the current live container. Called on every flip.
+func (p *Pool) recordLive(name string) {
+	if err := os.WriteFile(p.liveMarker(), []byte(name), 0o644); err != nil {
+		log.Printf("pool: recording live container: %v", err)
+	}
+}
+
+// recordedLive returns the last recorded live container if it still
+// exists, starting it if it was stopped (a rollback target legitimately
+// sits stopped in the ring). Empty when there is nothing usable.
+func (p *Pool) recordedLive() string {
+	b, err := os.ReadFile(p.liveMarker())
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(string(b))
+	if name == "" || !docker.Exists(name) {
+		return ""
+	}
+	if !docker.IsRunning(name) {
+		if err := docker.Start(name); err != nil {
+			return ""
+		}
+	}
+	return name
 }
 
 // heldMarker is the on-disk record that a version is held and has never

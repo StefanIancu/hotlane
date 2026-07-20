@@ -69,7 +69,15 @@ func httpHook(spec, backend string, budget time.Duration) Result {
 		return res
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	// Do not follow redirects: the hook asserts what THIS path answers.
+	// Following them made "/health == 200" pass when /health had
+	// regressed into a 302 to a login page that returns 200 - the exact
+	// regression the gate exists to catch - and made asserting a 3xx
+	// impossible.
+	client := &http.Client{
+		Timeout:       2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	deadline := time.Now().Add(budget)
 	last := "no response"
 	for time.Now().Before(deadline) {

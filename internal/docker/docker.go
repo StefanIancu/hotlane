@@ -197,7 +197,15 @@ func LayerDepth(container string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	out, err := run("history", "-q", img)
+	return ImageLayerDepth(img)
+}
+
+// ImageLayerDepth is LayerDepth for an image ref. Used as the reference
+// point for the fork chain: what matters is how far the chain has grown
+// past the image it started from, not how many layers that image
+// happened to have.
+func ImageLayerDepth(ref string) (int, error) {
+	out, err := run("history", "-q", ref)
 	if err != nil {
 		return 0, err
 	}

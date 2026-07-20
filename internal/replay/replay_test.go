@@ -319,3 +319,67 @@ func TestMismatchEndpointStripsQuery(t *testing.T) {
 		t.Errorf("Endpoint() = %q, want %q", got, "GET /reset")
 	}
 }
+
+// Enabling replay must not change what the app can serve. The recorder
+// wraps the ResponseWriter, and ReverseProxy type-asserts Flusher (to
+// stream SSE) and Hijacker (to upgrade websockets) - so a recorder that
+// only wraps Write turns every websocket into a 502 and freezes SSE.
+func TestCapturePreservesFlusherAndHijacker(t *testing.T) {
+	var sawFlusher, sawHijacker bool
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawFlusher = w.(http.Flusher)
+		_, sawHijacker = w.(http.Hijacker)
+		fmt.Fprint(w, "ok")
+	})
+	srv := httptest.NewServer(Capture(h, NewBuffer(4), map[string]bool{"GET": true}, nil))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !sawFlusher {
+		t.Error("wrapped writer lost http.Flusher - SSE streams would buffer until close")
+	}
+	if !sawHijacker {
+		t.Error("wrapped writer lost http.Hijacker - websocket upgrades would 502")
+	}
+}
+
+// Compressed bodies defeat normalization: the volatile patterns never
+// match, so an identical response with a timestamp inside reads as a
+// mismatch and the diff prints binary garbage.
+func TestCaptureSkipsEncodedResponses(t *testing.T) {
+	b := NewBuffer(4)
+	srv := httptest.NewServer(Capture(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+		w.Write([]byte("\x1f\x8b\x08garbage"))
+	}), b, map[string]bool{"GET": true}, nil))
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/")
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if b.Len() != 0 {
+		t.Errorf("compressed response was buffered; it would false-positive the gate")
+	}
+}
+
+// Query-distinct probes are different questions. Keying dynamism on the
+// path alone let one paginated endpoint exempt itself from body
+// comparison entirely.
+func TestDynamicKeyingIsPerFullPath(t *testing.T) {
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "page %s", r.URL.Query().Get("page"))
+	}, "/items?page=1", "/items?page=2")
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "REGRESSED")
+	}))
+	defer fork.Close()
+	res := Run(b.Snapshot(2), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Mismatched != 2 {
+		t.Errorf("total body regression hidden by dynamic suppression: %+v", res)
+	}
+}

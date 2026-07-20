@@ -189,6 +189,9 @@ func LoadDir(dir string) ([]*Config, error) {
 			}
 			byDomain[c.Domain] = name
 		}
+		if c.Domain == "" {
+			problems = append(problems, fmt.Sprintf("%s: domain: is required in a multi-app directory - traffic routes by Host header, so an app without one boots but can never be reached", name))
+		}
 		if c.Src == "" {
 			problems = append(problems, fmt.Sprintf("%s: src: is required in a multi-app directory (the checkout to snapshot/diff against)", name))
 		} else if fi, err := os.Stat(c.Src); err != nil || !fi.IsDir() {

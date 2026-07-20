@@ -10,9 +10,12 @@
 package replay
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -114,15 +117,43 @@ func (b *Buffer) Snapshot(n int) []Entry {
 }
 
 // recorder captures a response as it streams to the real client.
+//
+// It MUST forward Flush and Hijack. ReverseProxy type-asserts
+// http.Flusher to stream text/event-stream, and http.Hijacker to switch
+// protocols for websockets - so a recorder that only wraps Write turns
+// every websocket into a 502 and makes SSE streams deliver nothing until
+// the connection closes. Enabling replay must never change what the app
+// can serve.
 type recorder struct {
 	http.ResponseWriter
 	status   int
 	body     bytes.Buffer
 	overflow bool
+	hijacked bool
+	encoded  bool // Content-Encoding set: bytes are compressed, useless to compare
+}
+
+func (r *recorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("replay: underlying ResponseWriter is not a Hijacker")
+	}
+	r.hijacked = true // connection leaves HTTP; nothing to record
+	return h.Hijack()
 }
 
 func (r *recorder) WriteHeader(code int) {
 	r.status = code
+	// A compressed body normalizes to nothing useful: the volatile
+	// patterns never match, so an identical response with one timestamp
+	// inside reads as a mismatch, and the diff prints binary garbage.
+	r.encoded = r.ResponseWriter.Header().Get("Content-Encoding") != ""
 	r.ResponseWriter.WriteHeader(code)
 }
 
@@ -153,7 +184,7 @@ func Capture(next http.Handler, b *Buffer, methods map[string]bool, exclude []st
 		}
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		if bodyOverflow || rec.overflow {
+		if bodyOverflow || rec.overflow || rec.hijacked || rec.encoded {
 			return
 		}
 		b.add(Entry{
@@ -220,6 +251,12 @@ func (m Mismatch) Endpoint() string {
 	return m.Method + " " + pathOnly(m.Path)
 }
 
+// Incomplete reports that the run did not judge every entry - the
+// budget expired first. Not the same as "no mismatches": a fork that
+// hangs produces zero mismatches, so gate mode must treat this as a
+// failure rather than a clean sheet.
+func (r *Result) Incomplete() bool { return r.BudgetHit }
+
 // Result is one replay run's verdict, attached to push/test responses.
 type Result struct {
 	Replayed   int        `json:"replayed"`
@@ -263,7 +300,7 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 		go func(i int, e Entry) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			verdicts[i] = replayOne(ctx, client, backend, e, dynamic[e.Method+" "+pathOnly(e.Path)])
+			verdicts[i] = replayOne(ctx, client, backend, e, dynamic[e.Method+" "+e.Path])
 		}(i, e)
 	}
 	wg.Wait()
@@ -338,13 +375,16 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 	return v
 }
 
-// dynamicPaths finds method+path keys whose normalized live bodies
-// differ within the buffer slice.
+// dynamicPaths finds probes whose normalized live bodies differ across
+// repeats of the SAME request. The key is the full path INCLUDING the
+// query: /items?page=1 and /items?page=2 are different questions, and
+// treating them as one endpoint marks it dynamic and silently exempts
+// every paginated or filtered route from body comparison.
 func dynamicPaths(entries []Entry) map[string]bool {
 	seen := map[string]string{}
 	dyn := map[string]bool{}
 	for _, e := range entries {
-		key := e.Method + " " + pathOnly(e.Path)
+		key := e.Method + " " + e.Path
 		n := respdiff.Normalize(string(e.RespBody))
 		if prev, ok := seen[key]; ok && prev != n {
 			dyn[key] = true

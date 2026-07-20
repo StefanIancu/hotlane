@@ -504,7 +504,7 @@ func cmdLogs(args []string) {
 
 // printReplay renders a replay verdict in push/test human output.
 func printReplay(r *replay.Result) {
-	if r == nil || r.Replayed == 0 {
+	if r == nil || (r.Replayed == 0 && !r.BudgetHit) {
 		return
 	}
 	line := fmt.Sprintf("  replay %d/%d matched", r.Matched, r.Replayed)
@@ -512,7 +512,7 @@ func printReplay(r *replay.Result) {
 		line += fmt.Sprintf(" (%d dynamic, status-only)", r.Dynamic)
 	}
 	if r.BudgetHit {
-		line += " [budget hit]"
+		line += fmt.Sprintf(" [BUDGET EXPIRED - only %d of %d judged]", r.Replayed, r.Buffered)
 	}
 	fmt.Printf("%s (%dms, %d buffered)\n", line, r.Ms, r.Buffered)
 	for _, m := range r.Mismatches {
@@ -569,6 +569,20 @@ func appRequest(method, daemon, base, sub, contentType string, body []byte) (*ht
 		return resp, err
 	}
 	resp.Body.Close()
+	// A 404 on the namespaced path means one of two very different
+	// things: the daemon predates the /apps namespace, or it knows the
+	// namespace and this app name is not on it. Retrying blindly would
+	// send the request to whatever single app the daemon does serve -
+	// so `hotlane rollback -app typo` would roll back an unrelated
+	// production app and report success. Ask the daemon which it is.
+	if probe, perr := apiRequest("GET", daemon+"/-/v1/apps", "", nil); perr == nil {
+		known := probe.StatusCode != http.StatusNotFound
+		probe.Body.Close()
+		if known {
+			name := strings.TrimPrefix(base, "/-/v1/apps/")
+			return nil, fmt.Errorf("this daemon does not serve an app named %q - check -app / HOTLANE_APP / the app: field in hotlane.yml (hotlane status -all lists them)", name)
+		}
+	}
 	return apiRequest(method, daemon+"/-/v1"+sub, contentType, reader())
 }
 
@@ -583,12 +597,20 @@ func computeDiffE(daemon, apiBase, from string) ([]byte, error) {
 		}
 		base = b
 	}
-	diffArgs := []string{"diff", "HEAD", "--relative"}
+	// No --relative: the daemon applies the patch at the repo ROOT of its
+	// shadow tree, so paths must be repo-root-relative. With --relative,
+	// running `hotlane push` from a subdirectory silently drops every
+	// change outside that directory and rewrites the remaining paths -
+	// deploying a partial changeset that reports success.
+	// --binary: without it, a changed image/font/wasm becomes "Binary
+	// files differ", which git apply refuses - rejecting the whole push,
+	// including the text changes alongside it.
+	diffArgs := []string{"diff", "HEAD", "--binary"}
 	if base != "" {
 		if exec.Command("git", "cat-file", "-e", base+"^{commit}").Run() != nil {
 			return nil, fmt.Errorf("baseline commit %.12s is not in this clone - CI checkouts need history: use fetch-depth: 0 (or git fetch --unshallow) so the diff base exists", base)
 		}
-		diffArgs = []string{"diff", base, "--relative"}
+		diffArgs = []string{"diff", base, "--binary"}
 	}
 	diffCmd := exec.Command("git", diffArgs...)
 	diffCmd.Stderr = os.Stderr
@@ -925,6 +947,12 @@ func cmdDrift(args []string) {
 	body, _ := io.ReadAll(resp.Body)
 	if *jsonOut {
 		fmt.Println(string(bytes.TrimSpace(body)))
+		// A non-200 is a failed check, not a clean one: exiting 0 here
+		// would make a 401 or a misrouted request look like "no drift"
+		// to the CI job that gates on it.
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
 		var st archive.Status
 		if json.Unmarshal(body, &st) == nil && st.Drift == archive.DriftDrifted {
 			os.Exit(1)

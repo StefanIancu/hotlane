@@ -155,17 +155,39 @@ func (a *appRuntime) runReplay(backend string) *replay.Result {
 // overlayfs layer limit, ~125; every promoted fork adds one layer).
 // logReason preserves push's log lines without adding new ones to test.
 func (a *appRuntime) forkBase(logReason bool) string {
-	if a.arch.Drifted() {
+	// Both branches below need the clean image to actually exist. Drift
+	// can be flagged before the first clean build finishes (a manual
+	// drift-check at startup fails its cold boot), and forking from a
+	// nonexistent image fails every push until the build lands.
+	if a.arch.Drifted() && docker.ImageExists(a.arch.CleanImage()) {
 		if logReason {
 			log.Printf("push: forking from clean (drift recovery)")
 		}
 		return a.arch.CleanImage()
 	}
-	if d, err := docker.LayerDepth(a.pool.State().Live); err == nil && d >= a.rebaseDepth && docker.ImageExists(a.arch.CleanImage()) {
+	// Rebase on how far the CHAIN has grown, not on absolute image
+	// depth. Docker's ~125 layer cap is what we are avoiding, but the
+	// base image's own layers are a fixed cost the chain never adds to.
+	// Measured absolutely, an app whose base image is already deep would
+	// rebase on every single push - silently losing the warm caches that
+	// make hotlane fast, with no diagnostic.
+	clean := a.arch.CleanImage()
+	if !docker.ImageExists(clean) {
+		return ""
+	}
+	d, err := docker.LayerDepth(a.pool.State().Live)
+	if err != nil {
+		return ""
+	}
+	base, err := docker.ImageLayerDepth(clean)
+	if err != nil {
+		base = 0 // no reference point: fall back to absolute depth
+	}
+	if grown := d - base; grown >= a.rebaseDepth {
 		if logReason {
-			log.Printf("push: forking from clean (layer rebase at depth %d)", d)
+			log.Printf("push: forking from clean (chain grew %d layers past %s; total depth %d)", grown, clean, d)
 		}
-		return a.arch.CleanImage()
+		return clean
 	}
 	return ""
 }

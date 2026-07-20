@@ -147,12 +147,14 @@ step "auth: daemon restart adopts the live container, token gates the API"
 # promoted source, or every post-restart drift check false-positives.
 echo "hello-dirty" > message.txt
 pkill -x hotlane; sleep 2
-HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+HOTLANE_REBASE_DEPTH=1 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/" 200 30 || fail "adopt after restart failed"
 expect_body "http://$PROXY/" "hello from demo-app v4"
+# The API is a SEPARATE listener from the proxy: wait for it before
+# calling it, or this races daemon startup.
+wait_http "http://$API/healthz" 200 30 || fail "healthz should stay open without token"
 if "$BIN" status >/dev/null 2>&1; then fail "API served without token"; fi
 HOTLANE_TOKEN=supersecret "$BIN" status | grep -q "live: v7" || fail "authorized status failed"
-wait_http "http://$API/healthz" 200 5 || fail "healthz should stay open without token"
 
 step "restart keeps the promoted snapshot (stale-checkout guard)"
 wait_archive 7 || fail "drift not clean after restart - archivist re-snapshotted the dirty worktree"
@@ -167,26 +169,35 @@ echo "$MCP_OUT" | grep -q 'hotlane_push' || fail "mcp tools/list missing hotlane
 echo "$MCP_OUT" | grep -q 'baseline_commit' || fail "mcp hotlane_status call failed"
 
 step "auto-rebase: a deep layer chain forks from the clean image"
-# The restarted daemon runs with HOTLANE_REBASE_DEPTH=5; the base image
-# alone has more history entries than that, so the next push must rebase.
+# Depth is measured as growth PAST the clean image, not absolute image
+# depth - otherwise an app with a deep base image would rebase on every
+# push and silently lose its warm caches. With the threshold at 1 and a
+# chain already one layer past clean, the next push must rebase.
+# v7 was forked FROM the clean image, so the live chain sits AT clean
+# depth. This push grows it one layer past clean...
 perl -pi -e 's/"v4"/"v5"/' server.js
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "push rejected: $OUT"
+echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
+# ...so this one crosses the threshold and must rebase.
+perl -pi -e 's/"v5"/"v5b"/' server.js
 OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "rebase push rejected: $OUT"
 echo "$OUT" | grep -q "rebased from the clean image" || fail "no rebase marker in: $OUT"
-echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
-expect_body "http://$PROXY/" "hello from demo-app v5"
+echo "$OUT" | grep -q "PROMOTED v9" || fail "no PROMOTED v9 in: $OUT"
+expect_body "http://$PROXY/" "hello from demo-app v5b"
 
 step "restart while a fork is HELD must not adopt it as live"
 # A held fork is a RUNNING container with this app's label, so a naive
 # restart adopts it - putting unpromoted, unverified code in front of
 # users. This is the core promise, so it gets a permanent test.
 LIVE_BEFORE="$(curl -s "http://$PROXY/")"
-perl -pi -e 's/"v5"/"vNEVERPROMOTED"/' server.js
+perl -pi -e 's/"v5b"/"vNEVERPROMOTED"/' server.js
 OUT="$(HOTLANE_TOKEN=supersecret "$BIN" test)" || fail "hold before restart failed: $OUT"
 HVR=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
 [ -n "$HVR" ] || fail "no held fork before restart: $OUT"
 pkill -x hotlane; sleep 2
-HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+HOTLANE_REBASE_DEPTH=1 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
 wait_http "http://$PROXY/health" 200 60 || fail "daemon did not restart after holding a fork"
+wait_http "http://$API/healthz" 200 30 || fail "API did not come up after restart"
 [ "$(curl -s "http://$PROXY/")" = "$LIVE_BEFORE" ] || fail "restart changed live traffic: held fork was adopted"
 docker ps --filter "name=hotlane-demo-v$HVR" --format '{{.Names}}' | grep -q . && fail "held fork container v$HVR still running after restart"
 HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c "
@@ -194,7 +205,7 @@ import json,sys; d=json.load(sys.stdin)
 assert d['live'] != 'hotlane-demo-v$HVR', 'daemon adopted the held fork as live'
 assert d['held'] == [], 'stale held entries after restart: %r' % d['held']
 " || fail "post-restart state wrong"
-perl -pi -e 's/"vNEVERPROMOTED"/"v5"/' server.js
+perl -pi -e 's/"vNEVERPROMOTED"/"v5b"/' server.js
 
 
 step "replay: buffer fills, report mode flags a content change but promotes"
@@ -213,7 +224,7 @@ perl -pi -e 's/hello/howdy/' message.txt
 OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "report-mode push rejected: $OUT"
 echo "$OUT" | grep -q "MISMATCH GET /" || fail "no replay mismatch reported in: $OUT"
 echo "$OUT" | grep -q "PROMOTED" || fail "report mode should still promote: $OUT"
-expect_body "http://$PROXY/" "howdy from demo-app v5"
+expect_body "http://$PROXY/" "howdy from demo-app v5b"
 git commit -qam howdy   # align HEAD with the promoted source for the next dirty diff
 
 step "replay: gate mode rejects what verify hooks missed"
@@ -227,11 +238,12 @@ perl -pi -e 's/howdy/sneaky/' message.txt
 if OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push 2>&1)"; then fail "gated mismatch was promoted: $OUT"; fi
 echo "$OUT" | grep -q "MISMATCH GET /" || fail "no mismatch detail in gate rejection: $OUT"
 echo "$OUT" | grep -q "REJECTED" || fail "no REJECTED in gate output: $OUT"
-expect_body "http://$PROXY/" "howdy from demo-app v5"
+expect_body "http://$PROXY/" "howdy from demo-app v5b"
 git checkout -q message.txt
 
 step "replay phase 2: drift check catches tampering on a path no hook names"
-wait_archive 9 || fail "archive never caught up to v9 before the phase-2 drift check"
+LIVEV=$(HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+wait_archive "$LIVEV" || fail "archive never caught up to v$LIVEV before the phase-2 drift check"
 pkill -x hotlane; sleep 2
 # Hooks watch ONLY /health; "/" is invisible to hook-path comparison.
 python3 - <<'EOF'
