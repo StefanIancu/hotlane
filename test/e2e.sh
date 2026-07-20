@@ -261,6 +261,82 @@ for _ in $(seq 1 6); do curl -s "http://$PROXY/" >/dev/null; done   # users now 
 if OUT="$(HOTLANE_TOKEN=supersecret "$BIN" drift 2>&1)"; then fail "phase-2 drift not detected: $OUT"; fi
 echo "$OUT" | grep -q "replayed traffic differs on GET /" || fail "drift not attributed to replayed traffic: $OUT"
 
+step "rollback during an in-flight push is not undone by that push"
+# handleRollback used to skip the push lock, and Fork releases the pool
+# mutex before verify runs - so a rollback landing in a push's verify
+# window returned SUCCESS and was then silently reverted by that push's
+# promote. The operator kept serving the version they were escaping.
+pkill -x hotlane; sleep 2
+# Write the config explicitly rather than patching the inherited one:
+# earlier scenarios left replay in GATE mode, which would reject these
+# deliberate content changes and make the race untestable.
+cat > hotlane.yml <<'YAMLEOF'
+app: demo
+image: node:22-alpine
+run: node server.js
+port: 3000
+ring: 3
+verify:
+  - run: sleep 12
+YAMLEOF
+git commit -qam "explicit slow-verify config for the race scenarios"
+HOTLANE_REBASE_DEPTH=1 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 60 || fail "daemon did not start for the race scenario"
+wait_http "http://$API/healthz" 200 30 || fail "API did not come up"
+PRE_BODY="$(curl -s "http://$PROXY/")"
+perl -pi -e 's/"v[0-9a-zA-Z]*"/"vRACE"/' server.js
+( HOTLANE_TOKEN=supersecret "$BIN" push >/dev/null 2>&1 ) &
+PUSH_PID=$!
+sleep 4   # the push is now inside its 12s verify hook
+RB=$(HOTLANE_TOKEN=supersecret "$BIN" rollback 2>&1) || fail "rollback errored during a push: $RB"
+wait $PUSH_PID 2>/dev/null || true
+sleep 2
+POST_BODY="$(curl -s "http://$PROXY/")"
+[ "$POST_BODY" = "$PRE_BODY" ] || fail "rollback was undone by the in-flight push: expected '$PRE_BODY', serving '$POST_BODY'"
+LIVEC=$(HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["live"])')
+docker ps --filter "name=^${LIVEC}$" --format '{{.Names}}' | grep -q . || fail "live container $LIVEC is not running after the race"
+
+step "a held fork whose TTL expired cannot be promoted onto live"
+# The reaper ran unsynchronized with promote: if a TTL expired inside
+# PromoteHeld's verify window it destroyed the container, and promote
+# then pointed the public proxy at a port that no longer existed.
+pkill -x hotlane; sleep 2
+HOTLANE_HOLD_TTL=5s "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 60 || fail "daemon did not start for the TTL scenario"
+wait_http "http://$API/healthz" 200 30 || fail "API did not come up"
+BEFORE_TTL="$(curl -s "http://$PROXY/")"
+perl -pi -e 's/"vRACE"/"vEXPIRED"/' server.js
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" test)" || fail "hold for the TTL scenario failed: $OUT"
+TV=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
+sleep 40   # past the 5s TTL and past a 30s reaper tick
+if OUT="$(HOTLANE_TOKEN=supersecret "$BIN" promote "$TV" 2>&1)"; then
+  fail "promoted a fork whose TTL had expired and whose container was reaped: $OUT"
+fi
+[ "$(curl -s "http://$PROXY/")" = "$BEFORE_TTL" ] || fail "live changed after a failed expired-fork promote"
+wait_http "http://$PROXY/health" 200 10 || fail "app unreachable after the expired-fork promote attempt"
+perl -pi -e 's/"vEXPIRED"/"vRACE"/' server.js
+
+step "rollback during an archivist build does not false-positive drift"
+# Archive captured the live backend BY VALUE before a multi-minute
+# build, so a rollback in between left the drift check comparing
+# against a stopped container - a connection error read as drift, which
+# then forced every later push through the clean image.
+perl -pi -e 's/"vRACE"/"vBUILD"/' server.js
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" push)" || fail "push before the build race failed: $OUT"
+HOTLANE_TOKEN=supersecret "$BIN" rollback >/dev/null 2>&1 || fail "rollback during the archivist build failed"
+for _ in $(seq 1 60); do
+  BUILDING=$(HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["archive"]["building"])')
+  [ "$BUILDING" = "False" ] && break
+  sleep 2
+done
+DETAIL=$(HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["archive"].get("detail",""))')
+case "$DETAIL" in
+  *"connection refused"*|*"comparing"*)
+    fail "drift verdict came from a dead backend, not a real comparison: $DETAIL" ;;
+esac
+wait_http "http://$PROXY/health" 200 10 || fail "app unreachable after the build-race scenario"
+git checkout -q hotlane.yml server.js 2>/dev/null || true
+
 step "multi-app: two apps from one -apps dir, host-routed"
 pkill -x hotlane; sleep 2
 MAPPS="$TMP/apps"; mkdir -p "$MAPPS"
