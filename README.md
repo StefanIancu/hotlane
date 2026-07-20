@@ -69,15 +69,19 @@ hotlane rollback  # flip back, sub-second
 
 Requirements: a Linux or macOS host with Docker and git. One Go binary is both the daemon (`serve`) and the CLI.
 
-## Measured, not promised
+Common questions answered honestly in the docs: [isn't this mutable infrastructure?](docs/ci.md#isnt-this-mutable-infrastructure) · [what if the box dies?](docs/ci.md#what-happens-if-the-box-dies) · [why not ECS / Cloud Run / Kubernetes?](docs/ci.md#where-does-hotlane-run-and-not-run) · [is the API safe to expose?](docs/ci.md#is-the-api-safe-to-expose)
 
-Benchmarked against a real production GitHub Actions pipeline (15 runs of a real repo's deploy history) - method and honest caveats in [docs/benchmark.md](docs/benchmark.md):
+## Measured, not promised
 
 | | push to verified live (median) | rollback |
 |---|---|---|
-| Classical pipeline (GitHub Actions) | **8m 13s** | re-run the pipeline |
 | hotlane - TypeScript/Express (tsc build) | **1.72s** | 0.64s |
 | hotlane - FastAPI (pip) | **1.18s** | 0.65s |
+| *for reference:* a real GitHub Actions deploy pipeline | *493s (8m13s), 15-run median* | *re-run the pipeline* |
+
+**Read that reference row carefully - it is not a like-for-like comparison.** The 493s is a real production workflow deploying a bigger system (two images, registry, SSH deploy); putting these small bench apps through a fresh pipeline would be faster than that. The honest claim is structural, not a ratio: a pipeline pays runner queue + checkout + toolchain setup (typically 60-120s) *before it builds anything*, then an image build, a registry round-trip, and a scheduler deploy. hotlane skips all of it by mutating a warm machine that is already running your app - so the floor is your incremental build plus a boot, and that is what the top two rows measure. Full method, per-run data, and caveats: [docs/benchmark.md](docs/benchmark.md).
+
+Everything here is reproducible: `bench/bench.sh` with the workloads in `bench/`.
 
 ## Config
 

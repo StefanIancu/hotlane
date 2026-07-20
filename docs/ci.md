@@ -156,11 +156,47 @@ git diff "$BASE" --relative \
 
 The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /-/v1/test` (same body) holds the verified fork instead of promoting - reach it with the `X-Hotlane-Fork: <version>` header on the app URL, then `POST /-/v1/promote` or `/-/v1/discard` (`{"version": N}`). `POST /-/v1/rollback` and `POST /-/v1/drift-check` complete the surface. (On the private API port, bare `/v1/...` paths work as aliases.)
 
+## Isn't this mutable infrastructure?
+
+Yes - deliberately, on the serving path, and no on the artifact path.
+
+The fast lane mutates: a fork is a snapshot of the *running* container, so it inherits the warm filesystem (installed dependencies, build caches, a warm page cache) and the delta applies in milliseconds instead of minutes. That is where the speed comes from, and pretending otherwise would be dishonest.
+
+The trust lane does not mutate. After every promote the archivist rebuilds that exact version **from source, from scratch**, pushes it to your registry, and periodically cold-boots it to diff its behavior against what is actually live. So:
+
+- every promoted version has a reproducible, registry-pushed image - the artifact classical CI would have made, produced off the critical path instead of in front of the user
+- divergence between the running system and a from-source rebuild is *detected*, not assumed away, and pings your webhook
+- a drifted app self-heals: the next ordinary push forks from the clean image instead of the warm chain
+- fork chains rebase onto the clean image every ~40 pushes anyway, so the mutable chain never grows unbounded
+
+The usual argument for immutability is "you cannot trust a machine you have been mutating." The answer here is not faith, it is a continuously running experiment that would catch it. What immutable pipelines give you by construction, hotlane gives you by verification - and hands you the seconds back.
+
+## What happens if the box dies?
+
+You lose the app, exactly as you would lose any single-instance deployment - hotlane is not an HA system and does not pretend to be. What survives is everything needed to rebuild: your source in git, and every promoted version as a registry image the archivist pushed. Recovery is `docker run` of the last archived image on another box, or `hotlane serve` there and a push.
+
+If you need redundancy today, the honest answer is that hotlane is the wrong layer alone: run it per-box behind your own load balancer (each daemon deploys independently), or keep a managed platform for prod and use hotlane for the fast dev/staging/agent loop with the archivist's images feeding the prod pipeline. A gossiped multi-host version ring is on the [roadmap](roadmap.md) and is genuinely unbuilt.
+
 ## Where does hotlane run (and not run)?
 
 hotlane runs **on a machine you own with Docker**: a VPS, bare metal, an EC2 instance. It does not run on ECS, Fargate, Cloud Run, or Kubernetes, and not inside your app's image - it works by commanding the host's Docker daemon (forking live containers, keeping the version ring, fronting them with its proxy), which is exactly the layer managed platforms own themselves. hotlane is an alternative to that layer, not a passenger on it: the AWS equivalent of an ECS service is one EC2 instance running `hotlane serve`.
 
 Teams keeping a managed platform for prod can split the loops: hotlane on a cheap box for dev/staging/agent iteration, while the archivist's registry-pushed, from-source images feed the existing prod pipeline - every archived version is a normal image ECS or Kubernetes can deploy directly.
+
+**Could it ever run there?** Per platform, honestly:
+
+- **Cloud Run / Fargate**: no. There is no "snapshot this running container" API, no exec into the sandbox, and routing belongs to the platform. Nothing of the model survives.
+- **ECS on EC2**: only by smuggling - a privileged Docker-in-Docker task with hotlane commanding the nested daemon. It works and it is pointless: the platform sees one opaque container, you lose its scheduling, and a plain EC2 instance is strictly better.
+- **Kubernetes**: the one port that could preserve the promise, as an operator rather than this binary. Warm standby pods stand in for filesystem snapshots, the delta goes in via exec, and promote flips a Service label selector - which genuinely is a fast atomic pointer flip. That is a different product sharing this one's philosophy, not a flag on this one.
+
+## Is the API safe to expose?
+
+`-tls-domain` / `-tls` refuse to start without a token; tokens are compared in constant time; only `/-/healthz` is unauthenticated (and on a multi-app daemon it reports a count, never app names). App traffic on `https://yourdomain/` is untouched by any of this - it is your public app.
+
+Two things to know rather than discover:
+
+- **The daemon needs the Docker socket.** Anything that can talk to Docker can root the box, so treat the hotlane user as root-equivalent and the API token as a root credential. Keep the API on loopback (or a private network) unless you have a reason not to; `-tls` exists for when CI must reach it across the internet.
+- **Traffic replay buffers real user data in memory**, request headers included - stripping auth would make every replayed request a 401 and the feature useless. It is memory-only, capped, never written to disk, never archived, and dies with the process. If your traffic is sensitive enough that this matters, use `exclude:` for those paths or leave `replay:` off (it is off by default).
 
 ## Running the daemon under systemd
 

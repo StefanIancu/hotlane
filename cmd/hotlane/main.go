@@ -29,6 +29,7 @@ import (
 	"github.com/StefanIancu/hotlane/internal/archive"
 	"github.com/StefanIancu/hotlane/internal/config"
 	"github.com/StefanIancu/hotlane/internal/detect"
+	"github.com/StefanIancu/hotlane/internal/docker"
 	"github.com/StefanIancu/hotlane/internal/pool"
 	"github.com/StefanIancu/hotlane/internal/replay"
 	"github.com/StefanIancu/hotlane/internal/verify"
@@ -134,7 +135,27 @@ func apiRequest(method, url, contentType string, body io.Reader) (*http.Response
 	if tok := os.Getenv("HOTLANE_TOKEN"); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	return http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, clientHint(err)
+	}
+	return resp, nil
+}
+
+// clientHint turns transport failures into the thing to actually do.
+// "connection refused" on the default port means the daemon isn't
+// running, which is the most common confusion in a first session.
+func clientHint(err error) error {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "connection refused"):
+		return fmt.Errorf("%w\nno daemon is listening there. Start one on the app's host: hotlane serve\n"+
+			"(remote daemon? point HOTLANE_DAEMON at it, e.g. HOTLANE_DAEMON=https://deploy.example.com)", err)
+	case strings.Contains(s, "no such host"):
+		return fmt.Errorf("%w\ncheck HOTLANE_DAEMON - that hostname does not resolve", err)
+	default:
+		return err
+	}
 }
 
 // cmdInit writes a starter hotlane.yml based on what the repo looks like.
@@ -207,6 +228,12 @@ func cmdServe(args []string) {
 			*tlsOn = true
 		}
 		cfgs = []*config.Config{cfg}
+	}
+
+	// Fail on the real problem before booting anything: a missing or
+	// unusable Docker is somebody's first thirty seconds with hotlane.
+	if err := docker.Preflight(); err != nil {
+		log.Fatalf("hotlane: %v", err)
 	}
 
 	root := dataRoot()

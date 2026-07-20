@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -26,6 +27,32 @@ func run(args ...string) (string, error) {
 		return s, fmt.Errorf("docker %s: %w: %s", args[0], err, s)
 	}
 	return s, nil
+}
+
+// Preflight checks that Docker is present and usable before the daemon
+// tries to do anything with it. Every one of these failures is somebody's
+// first thirty seconds with hotlane, so each gets the fix, not a wrapped
+// exec error.
+func Preflight() error {
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(string(out))
+	switch {
+	case errors.Is(err, exec.ErrNotFound):
+		return fmt.Errorf("Docker is required, but no `docker` command is on PATH.\n" +
+			"  install it: https://docs.docker.com/engine/install/\n" +
+			"  hotlane runs your app in containers on this machine - see https://hotlane.dev/docs#where")
+	case strings.Contains(msg, "permission denied"):
+		return fmt.Errorf("Docker is installed but this user cannot talk to it:\n  %s\n"+
+			"  fix: sudo usermod -aG docker $USER   (then log out and back in, or run: newgrp docker)", msg)
+	case strings.Contains(msg, "Cannot connect to the Docker daemon"), strings.Contains(msg, "daemon is not running"):
+		return fmt.Errorf("Docker is installed but its daemon is not running:\n  %s\n"+
+			"  fix: sudo systemctl start docker   (macOS: open Docker Desktop)", msg)
+	default:
+		return fmt.Errorf("Docker is not usable:\n  %s", msg)
+	}
 }
 
 // Running returns the names of running hotlane containers for app, newest
