@@ -383,3 +383,47 @@ func TestDynamicKeyingIsPerFullPath(t *testing.T) {
 		t.Errorf("total body regression hidden by dynamic suppression: %+v", res)
 	}
 }
+
+// A fork that turns JSON into HTML, or redirects somewhere new, is a
+// regression - and a 3xx body is usually empty, so the body diff alone
+// would call it identical.
+func TestRunFlagsResponseHeaderChanges(t *testing.T) {
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	}, "/api")
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Mismatched != 1 || !strings.Contains(res.Mismatches[0].Got, "text/html") {
+		t.Errorf("content-type regression not flagged: %+v", res)
+	}
+
+	b2 := NewBuffer(8)
+	// Record without following the redirect, so the buffer holds the 3xx
+	// itself rather than whatever it points at.
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	srv2 := captureServer(b2, map[string]bool{"GET": true}, nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/dashboard")
+		w.WriteHeader(302)
+	})
+	resp2, err := noFollow.Get(srv2.URL + "/go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	srv2.Close()
+	fork2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/login")
+		w.WriteHeader(302)
+	}))
+	defer fork2.Close()
+	res2 := Run(b2.Snapshot(1), b2.Len(), strings.TrimPrefix(fork2.URL, "http://"), time.Second)
+	if res2.Mismatched != 1 {
+		t.Errorf("redirect target change not flagged (empty bodies match): %+v", res2)
+	}
+}

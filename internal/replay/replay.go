@@ -38,6 +38,13 @@ type Entry struct {
 
 	Status   int
 	RespBody []byte
+	// RespType and RespLocation are the response headers that carry
+	// behavioral contract. A fork that turns JSON into HTML, or redirects
+	// somewhere new, is a regression - and a 3xx body is usually empty,
+	// so the body diff alone is vacuously equal. Other headers (Date,
+	// Set-Cookie) are volatile by nature and deliberately not compared.
+	RespType     string
+	RespLocation string
 }
 
 // Buffer is a fixed-capacity ring of recent live exchanges.
@@ -188,12 +195,14 @@ func Capture(next http.Handler, b *Buffer, methods map[string]bool, exclude []st
 			return
 		}
 		b.add(Entry{
-			Method:   r.Method,
-			Path:     r.URL.RequestURI(),
-			Header:   r.Header.Clone(),
-			Body:     append([]byte(nil), reqBody.Bytes()...),
-			Status:   rec.status,
-			RespBody: append([]byte(nil), rec.body.Bytes()...),
+			Method:       r.Method,
+			Path:         r.URL.RequestURI(),
+			Header:       r.Header.Clone(),
+			Body:         append([]byte(nil), reqBody.Bytes()...),
+			Status:       rec.status,
+			RespBody:     append([]byte(nil), rec.body.Bytes()...),
+			RespType:     w.Header().Get("Content-Type"),
+			RespLocation: w.Header().Get("Location"),
 		})
 	})
 }
@@ -285,7 +294,14 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	client := &http.Client{Timeout: 5 * time.Second}
+	// Never follow redirects: the recorded entry IS the 3xx, and
+	// following it would compare whatever the redirect lands on instead
+	// - so a fork that changes where /go sends users would be judged on
+	// the destination page rather than the redirect itself.
+	client := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 
 	verdicts := make([]verdict, len(entries))
 	sem := make(chan struct{}, 4)
@@ -356,6 +372,22 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 
 	if resp.StatusCode != e.Status {
 		v.mis = &Mismatch{Method: e.Method, Path: e.Path, WantStatus: e.Status, GotStatus: resp.StatusCode}
+		return v
+	}
+	if got := resp.Header.Get("Content-Type"); e.RespType != "" && got != e.RespType {
+		v.mis = &Mismatch{
+			Method: e.Method, Path: e.Path,
+			WantStatus: e.Status, GotStatus: resp.StatusCode,
+			Want: "Content-Type: " + e.RespType, Got: "Content-Type: " + got,
+		}
+		return v
+	}
+	if got := resp.Header.Get("Location"); e.RespLocation != "" && got != e.RespLocation {
+		v.mis = &Mismatch{
+			Method: e.Method, Path: e.Path,
+			WantStatus: e.Status, GotStatus: resp.StatusCode,
+			Want: "Location: " + respdiff.Normalize(e.RespLocation), Got: "Location: " + respdiff.Normalize(got),
+		}
 		return v
 	}
 	if dyn {

@@ -55,7 +55,10 @@ type Archivist struct {
 	// users actually sent, not just the paths named in verify hooks.
 	ReplayEntries func() ([]replay.Entry, int)
 
-	mu             sync.Mutex
+	mu sync.Mutex // guards status only - never held across docker work
+	// checkMu serializes drift checks with each other (they share one
+	// container name) WITHOUT blocking status reads or the push path.
+	checkMu        sync.Mutex
 	status         Status
 	pendingVersion int    // a promote arrived mid-build; run again for this version
 	pendingBackend string // ...against this live backend
@@ -185,12 +188,27 @@ var buildSlots = make(chan struct{}, 2)
 
 // build generates a Dockerfile from hotlane.yml and does the cold build.
 func (a *Archivist) build() error {
+	// Build from a private copy. clean-src is rewritten by every promote
+	// (Snapshot does RemoveAll + cp -R), so building straight out of it
+	// races the next push: the tree can vanish or be half-copied
+	// mid-build, producing an empty or torn "clean" image that then
+	// false-positives drift or becomes the base for drift recovery.
 	a.mu.Lock()
-	src := a.srcDir()
-	a.mu.Unlock()
-	if _, err := os.Stat(src); err != nil {
+	snap := a.srcDir()
+	src := filepath.Join(a.DataDir, "clean-build")
+	if _, err := os.Stat(snap); err != nil {
+		a.mu.Unlock()
 		return fmt.Errorf("no source snapshot yet: %w", err)
 	}
+	if err := os.RemoveAll(src); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	if out, err := exec.Command("cp", "-R", snap, src).CombinedOutput(); err != nil {
+		a.mu.Unlock()
+		return fmt.Errorf("staging clean build: %v: %s", err, out)
+	}
+	a.mu.Unlock()
 
 	df := fmt.Sprintf("FROM %s\nWORKDIR %s\nCOPY . %s\n", a.Cfg.Image, a.Cfg.Workdir, a.Cfg.Workdir)
 	if a.Cfg.Build != "" {
@@ -236,8 +254,12 @@ func writeNoFollow(path string, data []byte) error {
 // deliberately behavior-based - filesystems are allowed to differ, what
 // the app does is not.
 func (a *Archivist) DriftCheck(liveBackend string) Status {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// Only one drift check at a time (they share a container name), but
+	// the status mutex stays free: holding it across a cold boot froze
+	// GET /-/v1/status AND every push - forkBase calls Drifted() inside
+	// the push lock - for the whole check, every six hours.
+	a.checkMu.Lock()
+	defer a.checkMu.Unlock()
 
 	name := "hotlane-" + a.Cfg.App + "-drift"
 	docker.Remove(name)
@@ -274,6 +296,7 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 	}
 	docker.Remove(name)
 
+	a.mu.Lock()
 	prev := a.status.Drift
 	a.status.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	if detail == "" {
@@ -286,16 +309,19 @@ func (a *Archivist) DriftCheck(liveBackend string) Status {
 		log.Printf("archive: drift check DRIFTED: %s", detail)
 	}
 
+	out := a.status
+	a.mu.Unlock()
+
 	// Notify on transitions only: a 6-hourly check in a persistent state
 	// should ping once when it breaks and once when it heals, not every
 	// run - alert fatigue is how notifications get ignored.
 	switch {
-	case a.status.Drift == DriftDrifted && prev != DriftDrifted:
+	case out.Drift == DriftDrifted && prev != DriftDrifted:
 		a.Notifier.Send(notify.EventDriftDetected, detail+"\nnext push will rebuild from "+a.CleanImage())
-	case a.status.Drift == DriftClean && prev == DriftDrifted:
+	case out.Drift == DriftClean && prev == DriftDrifted:
 		a.Notifier.Send(notify.EventDriftHealed, "")
 	}
-	return a.status
+	return out
 }
 
 // replayDrift replays the recorded live slice against the cold boot:

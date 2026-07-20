@@ -17,8 +17,15 @@ var volatile = []struct {
 	{regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?`), "<ts>"},                                                // ISO 8601
 	{regexp.MustCompile(`(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT`), "<ts>"}, // RFC 1123
 	{regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), "<uuid>"},
-	{regexp.MustCompile(`\b[0-9a-fA-F]{16,64}\b`), "<hex>"}, // request ids, hashes
-	{regexp.MustCompile(`\b\d{10,19}\b`), "<num>"},          // unix seconds/millis, counters
+	{regexp.MustCompile(`\b[0-9a-fA-F]{32,64}\b`), "<hex>"}, // request ids, trace ids
+	// Epoch-SHAPED only. `\d{10,19}` swallowed order numbers, account
+	// numbers, phone numbers with country code and cent-denominated
+	// balances - masking exactly the values a regression would change.
+	// Unix seconds and millis both start with 1 for the next century.
+	// 1[6-9]... keeps the window to ~2020-2033 rather than every
+	// ten-digit number that happens to start with 1 (order ids, balances).
+	{regexp.MustCompile(`\b1[6-9]\d{8}\b`), "<num>"},  // unix seconds
+	{regexp.MustCompile(`\b1[6-9]\d{11}\b`), "<num>"}, // unix millis
 }
 
 // Normalize masks volatile content so it never reads as drift.
