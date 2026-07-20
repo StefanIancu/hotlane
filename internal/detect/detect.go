@@ -128,7 +128,22 @@ func detectPython(dir string, g *Guess) {
 	}
 }
 
-var listenRe = regexp.MustCompile(`listen\(\s*(\d{2,5})`)
+// Port sniffing, most specific first. The old rule required a digit
+// immediately after `listen(`, which misses the single most common form
+// in real Node apps - `listen(process.env.PORT || 8080)` - and silently
+// fell back to 3000, generating a config whose verify hook can never
+// pass because nothing listens there.
+var portRes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)process\.env\.PORT\s*\|\|\s*(\d{2,5})`),     // listen(process.env.PORT || 8080)
+	regexp.MustCompile(`(?i)\bPORT\s*[=:]\s*['"` + "`" + `]?(\d{2,5})`), // const PORT = 8080 / PORT: 8080
+	regexp.MustCompile(`listen\(\s*(\d{2,5})`),                          // listen(3000, ...)
+	regexp.MustCompile(`listen\([^)]{0,80}?(\d{2,5})`),                  // listen(host, 8080) and friends
+}
+
+// commentRe strips line comments before sniffing: a commented-out
+// `// app.listen(4000)` above the real one used to win, because the
+// first match in the file was taken.
+var commentRe = regexp.MustCompile(`(?m)^\s*(//|#).*$`)
 
 // firstPort scans likely entrypoints for a listen(<port>) call.
 func firstPort(dir string, candidates []string, fallback int) int {
@@ -137,7 +152,12 @@ func firstPort(dir string, candidates []string, fallback int) int {
 		if err != nil {
 			continue
 		}
-		if m := listenRe.FindSubmatch(raw); m != nil {
+		body := commentRe.ReplaceAll(raw, nil)
+		for _, re := range portRes {
+			m := re.FindSubmatch(body)
+			if m == nil {
+				continue
+			}
 			var p int
 			fmt.Sscanf(string(m[1]), "%d", &p)
 			if p > 0 {

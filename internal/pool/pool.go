@@ -716,6 +716,17 @@ func (p *Pool) heldMarker(version int) string {
 // They are unreachable anyway - their access tokens lived only in memory
 // - so the only thing they could still do is be mistaken for live.
 func (p *Pool) reapHeldOnStart() {
+	// A crash during a drift check leaves hotlane-<app>-drift running.
+	// It carries its own label so the pool never adopts it, but it is a
+	// full instance of the app - background workers, cron, queue
+	// consumers and all - running against shared state with nobody
+	// watching. Nothing else collects it until the next check, up to six
+	// hours later.
+	if drift := "hotlane-" + p.Cfg.App + "-drift"; docker.Exists(drift) {
+		log.Printf("pool: removing orphaned drift container %s (left by a crash mid-check)", drift)
+		docker.Remove(drift)
+	}
+
 	markers, _ := filepath.Glob(filepath.Join(p.DataDir, "held", "v*.held"))
 	for _, m := range markers {
 		var v int
@@ -803,7 +814,11 @@ func (p *Pool) DiscardHeld(version int) error {
 }
 
 // StartHeldReaper discards held forks past their TTL.
-func (p *Pool) StartHeldReaper() {
+// StartHeldReaper expires held forks. It takes the caller's push lock
+// before discarding: PromoteHeld runs its verify gate with p.mu
+// RELEASED, so an unsynchronized reaper could rm -f a fork mid-promote
+// and leave the proxy pointed at a container that no longer exists.
+func (p *Pool) StartHeldReaper(pushLock sync.Locker) {
 	go func() {
 		for range time.Tick(30 * time.Second) {
 			p.mu.Lock()
@@ -815,8 +830,17 @@ func (p *Pool) StartHeldReaper() {
 			}
 			p.mu.Unlock()
 			for _, v := range expired {
-				log.Printf("pool: held fork v%d expired, discarding", v)
-				p.DiscardHeld(v)
+				pushLock.Lock()
+				// Re-check under the push lock: a promote may have
+				// claimed it while we waited.
+				p.mu.Lock()
+				_, still := p.held[v]
+				p.mu.Unlock()
+				if still {
+					log.Printf("pool: held fork v%d expired, discarding", v)
+					p.DiscardHeld(v)
+				}
+				pushLock.Unlock()
 			}
 		}
 	}()

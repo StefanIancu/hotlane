@@ -20,9 +20,31 @@ const LabelApp = "hotlane.app"
 // LabelVersion carries the ring version number.
 const LabelVersion = "hotlane.version"
 
+// verbTimeout bounds each docker verb. Nothing here may block forever:
+// Fork holds the pool mutex across commit/create/start, so one wedged
+// CLI would stall every deploy, rollback and status call - and `docker
+// commit` PAUSES the container it snapshots, which is the LIVE one, so
+// a hang there freezes production while the proxy keeps routing to it.
+func verbTimeout(verb string) time.Duration {
+	switch verb {
+	case "build", "push", "pull":
+		return 30 * time.Minute // cold builds and registry round-trips
+	case "commit", "cp", "create", "start", "stop", "rm", "rmi", "tag":
+		return 5 * time.Minute
+	default: // ps, inspect, port, history, logs, version
+		return 60 * time.Second
+	}
+}
+
 func run(args ...string) (string, error) {
-	out, err := exec.Command("docker", args...).CombinedOutput()
+	budget := verbTimeout(args[0])
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	s := strings.TrimSpace(string(out))
+	if ctx.Err() != nil {
+		return s, fmt.Errorf("docker %s: timed out after %s - the docker daemon is not responding: %s", args[0], budget, s)
+	}
 	if err != nil {
 		return s, fmt.Errorf("docker %s: %w: %s", args[0], err, s)
 	}

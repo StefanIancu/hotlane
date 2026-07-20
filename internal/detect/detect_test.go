@@ -64,3 +64,30 @@ func TestInterpretedStacksKeepTheDefault(t *testing.T) {
 		})
 	}
 }
+
+// The old rule needed a digit straight after `listen(`, so it missed the
+// single most common form in real Node apps and silently emitted
+// port 3000 - a config whose verify hook can never pass.
+func TestPortSniffingHandlesRealWorldPatterns(t *testing.T) {
+	cases := []struct {
+		name, src string
+		want      int
+	}{
+		{"env-fallback", `app.listen(process.env.PORT || 8080);`, 8080},
+		{"const-port", "const PORT = 4321;\napp.listen(PORT);", 4321},
+		{"literal", `app.listen(3000, () => {})`, 3000},
+		{"host-then-port", `server.listen("0.0.0.0", 9090)`, 9090},
+		{"commented-decoy", "// old: app.listen(4000)\napp.listen(process.env.PORT || 8080)", 8080},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g := app(t, map[string]string{
+				"package.json": `{"name":"x","scripts":{"start":"node server.js"}}`,
+				"server.js":    c.src,
+			})
+			if g.Port != c.want {
+				t.Errorf("port = %d, want %d for:\n%s", g.Port, c.want, c.src)
+			}
+		})
+	}
+}

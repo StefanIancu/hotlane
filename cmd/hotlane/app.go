@@ -66,7 +66,7 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 	}
 	st := a.pool.State()
 	a.front.Set(st.Backend)
-	a.pool.StartHeldReaper()
+	a.pool.StartHeldReaper(&a.pushMu)
 
 	a.notif = &notify.Notifier{URL: cfg.Notify, App: cfg.App}
 	a.arch = archive.New(cfg, a.pool.DataDir, a.notif)
@@ -86,7 +86,7 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 			log.Printf("hotlane: archive snapshot: %v", err)
 		}
 	}
-	go a.arch.Archive(st.Version, st.Backend)
+	go a.arch.Archive(st.Version, a.liveBackend)
 	return a, nil
 }
 
@@ -130,6 +130,13 @@ func (a *appRuntime) trafficHandler() http.Handler {
 		live.ServeHTTP(w, r)
 	})
 }
+
+// liveBackend is read at drift-check time, not when the build was
+// queued: a rollback during a multi-minute clean build would otherwise
+// leave the archivist comparing against a stopped container's address,
+// reporting false drift and forcing every later push through the clean
+// image - silently discarding the warm caches.
+func (a *appRuntime) liveBackend() string { return a.pool.State().Backend }
 
 // resetBuffer drops the recorded slice on any traffic flip - see
 // replay.Buffer.Reset for why stale recordings are poison.
@@ -255,6 +262,13 @@ func (a *appRuntime) handleDriftCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *appRuntime) handleRollback(w http.ResponseWriter, r *http.Request) {
+	// Rollback flips traffic, so it must serialize with the other
+	// flippers. Without this, a rollback landing while a push is in its
+	// verify window is silently undone moments later by that push's
+	// promote - the operator gets a success response and then keeps
+	// serving the exact version they were escaping.
+	a.pushMu.Lock()
+	defer a.pushMu.Unlock()
 	var req struct {
 		Version int `json:"version"`
 	}
@@ -336,7 +350,7 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 	if err := a.arch.Snapshot(a.pool.ShadowDir()); err != nil {
 		log.Printf("push: archive snapshot: %v", err)
 	} else {
-		go a.arch.Archive(res.Version, res.Backend)
+		go a.arch.Archive(res.Version, a.liveBackend)
 	}
 	json.NewEncoder(w).Encode(out)
 }
@@ -414,7 +428,7 @@ func (a *appRuntime) handlePromote(w http.ResponseWriter, r *http.Request) {
 	if err := a.arch.Snapshot(srcDir); err != nil {
 		log.Printf("promote: archive snapshot: %v", err)
 	} else {
-		go a.arch.Archive(res.Version, res.Backend)
+		go a.arch.Archive(res.Version, a.liveBackend)
 	}
 	os.RemoveAll(srcDir)
 	w.Header().Set("Content-Type", "application/json")

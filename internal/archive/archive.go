@@ -60,8 +60,8 @@ type Archivist struct {
 	// container name) WITHOUT blocking status reads or the push path.
 	checkMu        sync.Mutex
 	status         Status
-	pendingVersion int    // a promote arrived mid-build; run again for this version
-	pendingBackend string // ...against this live backend
+	pendingVersion int           // a promote arrived mid-build; run again for this version
+	pendingBackend func() string // ...resolving the live backend when the check runs
 }
 
 func New(cfg *config.Config, dataDir string, n *notify.Notifier) *Archivist {
@@ -120,7 +120,7 @@ func (a *Archivist) Snapshot(src string) error {
 // calls collapse: a promote landing mid-build queues exactly one follow-up
 // run for the newest version - dropped runs would leave a stale clean
 // image and false-positive drift verdicts under rapid pushes.
-func (a *Archivist) Archive(version int, liveBackend string) {
+func (a *Archivist) Archive(version int, liveBackend func() string) {
 	a.mu.Lock()
 	if a.status.Building {
 		a.pendingVersion, a.pendingBackend = version, liveBackend
@@ -163,7 +163,7 @@ func (a *Archivist) Archive(version int, liveBackend string) {
 			if stale {
 				log.Printf("archive: skipping drift check for v%d (newer promote queued)", version)
 			} else {
-				a.DriftCheck(liveBackend)
+				a.DriftCheck(liveBackend())
 			}
 		}
 
