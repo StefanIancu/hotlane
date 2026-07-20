@@ -156,6 +156,18 @@ git diff "$BASE" --relative \
 
 The response is JSON: fork phase timings, per-hook verify results, `promoted` true/false, and the fork's last logs on rejection. `POST /-/v1/test` (same body) holds the verified fork instead of promoting - reach it with the `X-Hotlane-Fork: <version>` header on the app URL, then `POST /-/v1/promote` or `/-/v1/discard` (`{"version": N}`). `POST /-/v1/rollback` and `POST /-/v1/drift-check` complete the surface. (On the private API port, bare `/v1/...` paths work as aliases.)
 
+## Compiled languages: give verify hooks a cold-start budget
+
+If your app compiles at boot (`run: go run .`, a JIT warm-up, anything that builds inside the container), set a generous `timeout:` on its http verify hook:
+
+```yaml
+verify:
+  - http: /health == 200
+    timeout: 120s      # a COLD start has no build cache
+```
+
+`hotlane init` now does this for Go automatically, but the reasoning matters if you write the config yourself. Ordinary pushes are fast because the fork inherits the live container's build cache - but two paths start **cold**: the archivist's drift check (it boots the from-source clean image) and any fork from that clean image. At the 15s http default, a perfectly healthy Go app fails its own drift check, gets flagged drifted, and then every push forks from clean for "drift recovery" and fails the same way. The app is fine; the budget was just too small for a cold compile.
+
 ## Isn't this mutable infrastructure?
 
 Yes - deliberately, on the serving path, and no on the artifact path.

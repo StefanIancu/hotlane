@@ -14,12 +14,21 @@ import (
 
 // Guess is a suggested configuration.
 type Guess struct {
-	App       string
-	Image     string
-	Build     string
-	Run       string
-	Port      int
-	Framework string // human label for the init message
+	App   string
+	Image string
+	Build string
+	Run   string
+	Port  int
+	// VerifyTimeout overrides the 15s http-hook default for stacks that
+	// compile at boot. The warm path is fast (the build cache is
+	// inherited from the live container), but the COLD path - the
+	// archivist's drift check, and any fork from the clean image - starts
+	// with no cache. Left at the default, a Go app fails its own drift
+	// check, gets flagged drifted, and then every push forks from clean
+	// and fails the same way: a self-sustaining rejection loop on a
+	// perfectly healthy app.
+	VerifyTimeout string
+	Framework     string // human label for the init message
 }
 
 // Detect inspects dir and returns its best guess.
@@ -35,6 +44,7 @@ func Detect(dir string) *Guess {
 		g.Image = "golang:1.24-alpine"
 		g.Run = "go run ."
 		g.Port = 8080
+		g.VerifyTimeout = "120s"
 	default:
 		g.Framework = "unknown"
 		g.Image = "alpine:3.20"
@@ -176,7 +186,12 @@ func (g *Guess) YAML() string {
 	fmt.Fprintf(&b, "port: %d\n", g.Port)
 	b.WriteString("verify:\n")
 	b.WriteString("  - http: / == 200        # add a real /health endpoint and check it here\n")
-	b.WriteString("  #  timeout: 5s          # optional per-hook budget (defaults: http 15s, run 60s)\n")
+	if g.VerifyTimeout != "" {
+		fmt.Fprintf(&b, "    timeout: %s         # this stack compiles at boot; a COLD start (drift check,\n", g.VerifyTimeout)
+		b.WriteString("                          #   or a fork from the clean image) has no build cache\n")
+	} else {
+		b.WriteString("  #  timeout: 5s          # optional per-hook budget (defaults: http 15s, run 60s)\n")
+	}
 	b.WriteString("ring: 5                   # versions kept for instant rollback\n")
 	b.WriteString("# archive: registry/ref   # push the archivist's clean images here\n")
 	b.WriteString("# notify: ${HOTLANE_NOTIFY_URL}  # webhook for drift + rejected-push events;\n")
