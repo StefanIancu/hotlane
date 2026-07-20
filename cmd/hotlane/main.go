@@ -356,8 +356,8 @@ func cmdServe(args []string) {
 			out = append(out, map[string]any{
 				"app":     a.cfg.App,
 				"domain":  a.cfg.Domain,
-				"version": a.pool.Version,
-				"live":    a.pool.Live,
+				"version": a.pool.State().Version,
+				"live":    a.pool.State().Live,
 				"drift":   a.arch.Status().Drift,
 			})
 		}

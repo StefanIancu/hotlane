@@ -92,6 +92,11 @@ func (p *Pool) Ensure() error {
 	if err := p.ensurePristine(); err != nil {
 		return err
 	}
+	// A held fork is a RUNNING container with this app's label, so it
+	// would otherwise look like the newest live version and get adopted -
+	// putting unpromoted, untested code in front of users on a restart.
+	// The held marker survives the daemon, so reap them before adopting.
+	p.reapHeldOnStart()
 	running, err := docker.Running(p.Cfg.App)
 	if err != nil {
 		return err
@@ -549,6 +554,9 @@ func (p *Pool) Hold(res *ForkResult, ttl time.Duration) error {
 	if err := copyTree(p.ShadowDir(), src); err != nil {
 		return err
 	}
+	if err := os.WriteFile(p.heldMarker(res.Version), nil, 0o644); err != nil {
+		return err
+	}
 	tok := make([]byte, 16)
 	if _, err := rand.Read(tok); err != nil {
 		return fmt.Errorf("generating fork token: %w", err)
@@ -588,6 +596,63 @@ func (p *Pool) HeldProxy(header string) http.Handler {
 		return nil
 	}
 	return h.proxy
+}
+
+// State is a consistent snapshot of the pool's mutable serving state.
+// The fields below are written under p.mu by Fork/Promote/Rollback while
+// HTTP handlers read them concurrently, so readers outside this package
+// must go through State - reading the fields directly is a data race,
+// and a torn string read hands back garbage or crashes the daemon.
+type State struct {
+	Live     string
+	Backend  string
+	Version  int
+	LastFork *ForkResult
+	Baseline string
+}
+
+// State returns the current serving state. Never call it from a method
+// that already holds p.mu.
+func (p *Pool) State() State {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return State{
+		Live:     p.Live,
+		Backend:  p.Backend,
+		Version:  p.Version,
+		LastFork: p.LastFork,
+		Baseline: p.BaselineCommit,
+	}
+}
+
+// heldMarker is the on-disk record that a version is held and has never
+// served traffic. Written when the fork is held, removed BEFORE promote
+// flips traffic to it - so a crash mid-promote leaves no marker and the
+// (verified, now-live) container is adopted normally, while a crash
+// while merely holding leaves the marker and the fork gets reaped.
+func (p *Pool) heldMarker(version int) string {
+	return filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d.held", version))
+}
+
+// reapHeldOnStart destroys forks that were held when the daemon stopped.
+// They are unreachable anyway - their access tokens lived only in memory
+// - so the only thing they could still do is be mistaken for live.
+func (p *Pool) reapHeldOnStart() {
+	markers, _ := filepath.Glob(filepath.Join(p.DataDir, "held", "v*.held"))
+	for _, m := range markers {
+		var v int
+		if _, err := fmt.Sscanf(filepath.Base(m), "v%d.held", &v); err != nil {
+			continue
+		}
+		name := containerName(p.Cfg.App, v)
+		if docker.Exists(name) {
+			log.Printf("pool: reaping fork v%d held when the daemon stopped (never promoted, never served traffic)", v)
+			docker.Remove(name)
+			docker.RemoveImage(p.imageRef(v))
+		}
+		os.Remove(m)
+		os.RemoveAll(filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", v)))
+	}
 }
 
 // Held returns a held fork by version, or nil.
@@ -632,6 +697,9 @@ func (p *Pool) PromoteHeld(version int, ready func(container, backend string) er
 			return "", nil, fmt.Errorf("held fork v%d not ready: %w", version, err)
 		}
 	}
+	// Clear the marker before the flip: from here on this container may
+	// be serving traffic, so a crash must leave it adoptable.
+	os.Remove(p.heldMarker(version))
 	p.Promote(h.Result)
 	p.mu.Lock()
 	delete(p.held, version)
@@ -651,6 +719,7 @@ func (p *Pool) DiscardHeld(version int) error {
 		return fmt.Errorf("no held fork v%d", version)
 	}
 	p.Discard(h.Result)
+	os.Remove(p.heldMarker(version))
 	os.RemoveAll(h.SrcDir)
 	return nil
 }

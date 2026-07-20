@@ -64,7 +64,8 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 	if err := a.pool.Ensure(); err != nil {
 		return nil, fmt.Errorf("warm pool: %w", err)
 	}
-	a.front.Set(a.pool.Backend)
+	st := a.pool.State()
+	a.front.Set(st.Backend)
 	a.pool.StartHeldReaper()
 
 	a.notif = &notify.Notifier{URL: cfg.Notify, App: cfg.App}
@@ -85,7 +86,7 @@ func newAppRuntime(cfg *config.Config, src, dataRoot string) (*appRuntime, error
 			log.Printf("hotlane: archive snapshot: %v", err)
 		}
 	}
-	go a.arch.Archive(a.pool.Version, a.pool.Backend)
+	go a.arch.Archive(st.Version, st.Backend)
 	return a, nil
 }
 
@@ -97,7 +98,7 @@ func startDriftTicker(apps []*appRuntime) {
 	go func() {
 		for range time.Tick(6 * time.Hour) {
 			for _, a := range apps {
-				a.arch.DriftCheck(a.pool.Backend)
+				a.arch.DriftCheck(a.pool.State().Backend)
 			}
 		}
 	}()
@@ -160,7 +161,7 @@ func (a *appRuntime) forkBase(logReason bool) string {
 		}
 		return a.arch.CleanImage()
 	}
-	if d, err := docker.LayerDepth(a.pool.Live); err == nil && d >= a.rebaseDepth && docker.ImageExists(a.arch.CleanImage()) {
+	if d, err := docker.LayerDepth(a.pool.State().Live); err == nil && d >= a.rebaseDepth && docker.ImageExists(a.arch.CleanImage()) {
 		if logReason {
 			log.Printf("push: forking from clean (layer rebase at depth %d)", d)
 		}
@@ -185,14 +186,15 @@ func (a *appRuntime) ready(container, backend string) error {
 }
 
 func (a *appRuntime) handleStatus(w http.ResponseWriter, r *http.Request) {
+	st := a.pool.State()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"app":             a.cfg.App,
-		"live":            a.pool.Live,
-		"version":         a.pool.Version,
+		"live":            st.Live,
+		"version":         st.Version,
 		"backend":         a.front.Target(),
-		"baseline_commit": a.pool.BaselineCommit,
-		"last_fork":       a.pool.LastFork,
+		"baseline_commit": st.Baseline,
+		"last_fork":       st.LastFork,
 		"ring":            a.pool.Ring(),
 		"held":            a.pool.HeldList(),
 		"archive":         a.arch.Status(),
@@ -221,11 +223,11 @@ func (a *appRuntime) handleLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintln(w, docker.Logs(a.pool.Live, tail))
+	fmt.Fprintln(w, docker.Logs(a.pool.State().Live, tail))
 }
 
 func (a *appRuntime) handleDriftCheck(w http.ResponseWriter, r *http.Request) {
-	st := a.arch.DriftCheck(a.pool.Backend)
+	st := a.arch.DriftCheck(a.pool.State().Backend)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(st)
 }

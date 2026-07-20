@@ -175,6 +175,28 @@ echo "$OUT" | grep -q "rebased from the clean image" || fail "no rebase marker i
 echo "$OUT" | grep -q "PROMOTED v8" || fail "no PROMOTED v8 in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v5"
 
+step "restart while a fork is HELD must not adopt it as live"
+# A held fork is a RUNNING container with this app's label, so a naive
+# restart adopts it - putting unpromoted, unverified code in front of
+# users. This is the core promise, so it gets a permanent test.
+LIVE_BEFORE="$(curl -s "http://$PROXY/")"
+perl -pi -e 's/"v5"/"vNEVERPROMOTED"/' server.js
+OUT="$(HOTLANE_TOKEN=supersecret "$BIN" test)" || fail "hold before restart failed: $OUT"
+HVR=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
+[ -n "$HVR" ] || fail "no held fork before restart: $OUT"
+pkill -x hotlane; sleep 2
+HOTLANE_REBASE_DEPTH=5 "$BIN" serve -config "$APP/hotlane.yml" -addr "$API" -proxy "$PROXY" -token supersecret >>"$DLOG" 2>&1 &
+wait_http "http://$PROXY/health" 200 60 || fail "daemon did not restart after holding a fork"
+[ "$(curl -s "http://$PROXY/")" = "$LIVE_BEFORE" ] || fail "restart changed live traffic: held fork was adopted"
+docker ps --filter "name=hotlane-demo-v$HVR" --format '{{.Names}}' | grep -q . && fail "held fork container v$HVR still running after restart"
+HOTLANE_TOKEN=supersecret "$BIN" status -json | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+assert d['live'] != 'hotlane-demo-v$HVR', 'daemon adopted the held fork as live'
+assert d['held'] == [], 'stale held entries after restart: %r' % d['held']
+" || fail "post-restart state wrong"
+perl -pi -e 's/"vNEVERPROMOTED"/"v5"/' server.js
+
+
 step "replay: buffer fills, report mode flags a content change but promotes"
 pkill -x hotlane; sleep 2
 printf 'replay:\n  last: 20\n' >> hotlane.yml
