@@ -272,8 +272,11 @@ func (a *appRuntime) handleRollback(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version int `json:"version"`
 	}
-	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Decode whenever there IS a body, not only when its length is
+	// known: a chunked request used to fall through to the default
+	// rollback, silently ignoring the version the caller asked for.
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -290,9 +293,15 @@ func (a *appRuntime) handleRollback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
-	diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	// One byte over the cap, so truncation is detectable: silently
+	// cutting a patch surfaces later as a baffling "corrupt patch" 422.
+	diff, err := io.ReadAll(io.LimitReader(r.Body, (10<<20)+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(diff) > 10<<20 {
+		http.Error(w, "diff exceeds the 10MB limit - split the change, or check for large files that should be in .gitignore", http.StatusRequestEntityTooLarge)
 		return
 	}
 	a.pushMu.Lock()
@@ -369,9 +378,15 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 // promote. The caller pokes the fork through the X-Hotlane-Fork header,
 // then promotes/discards.
 func (a *appRuntime) handleTest(w http.ResponseWriter, r *http.Request) {
-	diff, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	// One byte over the cap, so truncation is detectable: silently
+	// cutting a patch surfaces later as a baffling "corrupt patch" 422.
+	diff, err := io.ReadAll(io.LimitReader(r.Body, (10<<20)+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(diff) > 10<<20 {
+		http.Error(w, "diff exceeds the 10MB limit - split the change, or check for large files that should be in .gitignore", http.StatusRequestEntityTooLarge)
 		return
 	}
 	a.pushMu.Lock()

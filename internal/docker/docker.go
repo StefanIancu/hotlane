@@ -200,7 +200,10 @@ func Exec(name, workdir, cmd string, timeout time.Duration) (string, error) {
 
 // Logs returns the last n lines of a container's output (best effort).
 func Logs(name string, n int) string {
-	out, _ := run("logs", "--tail", strconv.Itoa(n), name)
+	out, err := run("logs", "--tail", strconv.Itoa(n), name)
+	if err != nil {
+		return fmt.Sprintf("(hotlane could not read logs for %s: %v)", name, err)
+	}
 	return out
 }
 

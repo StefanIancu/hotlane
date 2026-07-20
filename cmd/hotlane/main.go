@@ -269,9 +269,19 @@ func cmdServe(args []string) {
 	for _, cfg := range cfgs {
 		a, err := newAppRuntime(cfg, cfg.Src, root)
 		if err != nil {
+			// On a multi-app daemon, one app's transient Docker problem
+			// must not take every OTHER app offline. Fail hard only when
+			// there is nothing left to serve.
+			if len(cfgs) > 1 {
+				log.Printf("hotlane: %s FAILED TO START (%v) - continuing with the other apps; fix it and restart", cfg.App, err)
+				continue
+			}
 			log.Fatalf("hotlane: %s: %v", cfg.App, err)
 		}
 		apps = append(apps, a)
+	}
+	if len(apps) == 0 {
+		log.Fatal("hotlane: no app started successfully")
 	}
 	single := len(apps) == 1
 	startDriftTicker(apps)
@@ -288,7 +298,7 @@ func cmdServe(args []string) {
 		hostTraffic := map[string]http.Handler{}
 		for _, a := range apps {
 			if a.cfg.Domain != "" {
-				hostTraffic[a.cfg.Domain] = a.trafficHandler()
+				hostTraffic[strings.ToLower(a.cfg.Domain)] = a.trafficHandler()
 			}
 		}
 		appTraffic = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -296,6 +306,9 @@ func cmdServe(args []string) {
 			if h, _, err := net.SplitHostPort(host); err == nil {
 				host = h
 			}
+			// Host is case-insensitive and may carry a trailing dot
+			// (a legal absolute FQDN); neither should 421.
+			host = strings.ToLower(strings.TrimSuffix(host, "."))
 			h, ok := hostTraffic[host]
 			if !ok {
 				http.Error(w, "hotlane: no app for host "+host, http.StatusMisdirectedRequest)
@@ -589,6 +602,9 @@ func appRequest(method, daemon, base, sub, contentType string, body []byte) (*ht
 // computeDiffE builds the delta to send: from the daemon's baseline
 // commit (or an explicit ref) to the working tree.
 func computeDiffE(daemon, apiBase, from string) ([]byte, error) {
+	if err := exec.Command("git", "rev-parse", "--git-dir").Run(); err != nil {
+		return nil, fmt.Errorf("not a git repository - run hotlane push from your app's checkout (hotlane sends a git diff)")
+	}
 	base := from
 	if base == "" {
 		b, err := daemonBaselineE(daemon, apiBase)
@@ -618,7 +634,33 @@ func computeDiffE(daemon, apiBase, from string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("git diff: %w", err)
 	}
+	warnAboutDiff(base, diff)
 	return diff, nil
+}
+
+// warnAboutDiff surfaces the ways a push can silently ship something
+// other than what the user sees in their editor. All of these produce a
+// SUCCESSFUL deploy of the wrong content, which is worse than an error.
+func warnAboutDiff(base string, diff []byte) {
+	// Untracked files are invisible to git diff. New file + edited file
+	// = a non-empty diff and a deploy missing the new file entirely.
+	if out, err := exec.Command("git", "ls-files", "--others", "--exclude-standard").Output(); err == nil {
+		if n := len(bytes.Fields(out)); n > 0 {
+			log.Printf("hotlane: %d untracked file(s) will NOT be deployed - `git add -N <path>` to include them", n)
+		}
+	}
+	// A gitlink hunk moves the pointer; the submodule's files are not in
+	// the patch, so the deploy silently keeps the old revision.
+	if bytes.Contains(diff, []byte("Subproject commit")) {
+		log.Print("hotlane: this diff bumps a submodule pointer - submodule CONTENTS are not deployed, only the pointer line")
+	}
+	// A baseline that is no longer an ancestor (rebase, force-push)
+	// makes the diff revert whatever happened in between.
+	if base != "" {
+		if err := exec.Command("git", "merge-base", "--is-ancestor", base, "HEAD").Run(); err != nil {
+			log.Printf("hotlane: the daemon's baseline %.12s is not an ancestor of HEAD (rebased or force-pushed?) - this diff may REVERT work; use -from <ref> if that is wrong", base)
+		}
+	}
 }
 
 // computeDiff is computeDiffE with CLI ergonomics (fatal on error).

@@ -260,6 +260,9 @@ func (c *Config) validate() error {
 	if strings.ContainsAny(c.Domain, "/: ") {
 		problems = append(problems, fmt.Sprintf("domain: %q must be a bare hostname (no scheme, port, or path)", c.Domain))
 	}
+	if c.Ring < 0 {
+		problems = append(problems, "ring: must be >= 0 (0 means the default of 5)")
+	}
 	if c.Replay.Last < 0 {
 		problems = append(problems, "replay.last: must be >= 0")
 	}

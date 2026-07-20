@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type rpcRequest struct {
@@ -89,8 +91,21 @@ func cmdMCP(args []string) {
 		if len(line) == 0 {
 			continue
 		}
+		// A batch (JSON array) is valid JSON-RPC 2.0 and part of the
+		// protocol version advertised below, and malformed JSON demands
+		// -32700. Silently `continue`ing on either left the client
+		// blocked forever on a request id that would never be answered.
+		if line[0] == '[' {
+			reply(json.RawMessage("null"), nil, map[string]any{
+				"code": -32600, "message": "batch requests are not supported; send one request per line",
+			})
+			continue
+		}
 		var req rpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
+			reply(json.RawMessage("null"), nil, map[string]any{
+				"code": -32700, "message": "parse error: " + err.Error(),
+			})
 			continue
 		}
 		switch req.Method {
@@ -121,16 +136,41 @@ func cmdMCP(args []string) {
 			reply(req.ID, nil, map[string]any{"code": -32601, "message": "method not found: " + req.Method})
 		}
 	}
+	// A line over the scanner's buffer (16MB) ends Scan with an error
+	// that used to go unchecked: the loop exited and the process
+	// returned 0, so the agent saw a clean shutdown indistinguishable
+	// from a normal close, mid-session.
+	if err := in.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "hotlane mcp: input stream failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // mcpCall dispatches one tool invocation against the daemon API and
 // returns the response body (JSON text) and whether it is an error.
 func mcpCall(daemon, base, name string, args map[string]any) (string, bool) {
-	argInt := func(k string) int {
-		if v, ok := args[k].(float64); ok {
-			return int(v)
+	// argInt must distinguish "absent" from "zero". For rollback,
+	// version 0 is the legitimate encoding of "the version before
+	// live", so a client sending {"version":"3"} - a routine LLM
+	// coercion - would silently roll production back one version and
+	// report success. Strings that look like numbers are accepted;
+	// anything else is an explicit error.
+	argInt := func(k string) (int, bool) {
+		switch v := args[k].(type) {
+		case float64:
+			return int(v), true
+		case string:
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			return n, err == nil
 		}
-		return 0
+		return 0, false
+	}
+	needInt := func(k string) (int, string) {
+		n, ok := argInt(k)
+		if !ok {
+			return 0, fmt.Sprintf(`{"error":"%s is required and must be a number"}`, k)
+		}
+		return n, ""
 	}
 	argStr := func(k string) string {
 		v, _ := args[k].(string)
@@ -168,15 +208,33 @@ func mcpCall(daemon, base, name string, args map[string]any) (string, bool) {
 		}
 		return do("POST", path, diff, "text/x-diff")
 	case "hotlane_promote":
-		return do("POST", "/promote", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		v, errMsg := needInt("version")
+		if errMsg != "" {
+			return errMsg, true
+		}
+		return do("POST", "/promote", jsonBody(map[string]int{"version": v}), "application/json")
 	case "hotlane_discard":
-		return do("POST", "/discard", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		v, errMsg := needInt("version")
+		if errMsg != "" {
+			return errMsg, true
+		}
+		return do("POST", "/discard", jsonBody(map[string]int{"version": v}), "application/json")
 	case "hotlane_rollback":
-		return do("POST", "/rollback", jsonBody(map[string]int{"version": argInt("version")}), "application/json")
+		// version is genuinely optional here, but an UNPARSEABLE one
+		// must not silently become "the version before live".
+		v := 0
+		if raw, present := args["version"]; present && raw != nil {
+			n, ok := argInt("version")
+			if !ok {
+				return `{"error":"version must be a number (omit it to roll back to the version before live)"}`, true
+			}
+			v = n
+		}
+		return do("POST", "/rollback", jsonBody(map[string]int{"version": v}), "application/json")
 	case "hotlane_drift":
 		return do("POST", "/drift-check", nil, "application/json")
 	case "hotlane_logs":
-		tail := argInt("tail")
+		tail, _ := argInt("tail")
 		if tail <= 0 {
 			tail = 100
 		}

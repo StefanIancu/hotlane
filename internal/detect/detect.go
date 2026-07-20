@@ -86,7 +86,21 @@ func detectNode(dir string, g *Guess) {
 	case pkg.Main != "":
 		g.Run = "node " + pkg.Main
 	default:
-		g.Run = "node index.js"
+		// No start script and no main: guess an entrypoint that is
+		// actually present rather than emitting `node index.js` for a
+		// file that does not exist - which builds fine and then exits
+		// instantly on every boot, with nothing explaining why.
+		g.Run = ""
+		for _, cand := range []string{"server.js", "index.js", "app.js", "src/server.js", "src/index.js", "dist/index.js"} {
+			if exists(dir, cand) {
+				g.Run = "node " + cand
+				break
+			}
+		}
+		if g.Run == "" {
+			g.Run = "node index.js"
+			g.Framework += " (NO start script or main found - set run: yourself)"
+		}
 	}
 }
 
@@ -100,15 +114,31 @@ func detectPython(dir string, g *Guess) {
 		g.Build = "pip install -r requirements.txt"
 	} else {
 		deps = readLower(dir, "pyproject.toml")
-		g.Build = "pip install ."
+		// A pyproject.toml is very often tool config only (ruff, black,
+		// pytest) with no [project] or [build-system] table. `pip
+		// install .` then fails outright and no deploy ever succeeds.
+		if strings.Contains(deps, "[project]") || strings.Contains(deps, "[build-system]") {
+			g.Build = "pip install ."
+		} else {
+			g.Build = ""
+		}
 	}
 
-	module := "main"
-	for _, cand := range []string{"main.py", "app.py", "server.py"} {
+	// Look beyond the repo root: app/main.py and src/api/main.py are at
+	// least as common as main.py, and pointing uvicorn at a module that
+	// does not exist produces a container that cannot start.
+	module := ""
+	for _, cand := range []string{
+		"main.py", "app.py", "server.py",
+		"app/main.py", "src/main.py", "api/main.py", "src/app.py",
+	} {
 		if exists(dir, cand) {
-			module = strings.TrimSuffix(cand, ".py")
+			module = strings.ReplaceAll(strings.TrimSuffix(cand, ".py"), "/", ".")
 			break
 		}
+	}
+	if module == "" {
+		module = "main"
 	}
 
 	switch {

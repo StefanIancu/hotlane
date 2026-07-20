@@ -62,6 +62,7 @@ type Archivist struct {
 	status         Status
 	pendingVersion int           // a promote arrived mid-build; run again for this version
 	pendingBackend func() string // ...resolving the live backend when the check runs
+	skipped        int           // consecutive drift checks skipped for a queued promote
 }
 
 func New(cfg *config.Config, dataDir string, n *notify.Notifier) *Archivist {
@@ -145,12 +146,12 @@ func (a *Archivist) Archive(version int, liveBackend func() string) {
 
 			if a.Cfg.Archive != "" {
 				ref := fmt.Sprintf("%s:v%d", a.Cfg.Archive, version)
-				if err := docker.TagImage(a.CleanImage(), ref); err == nil {
-					if err := docker.Push(ref); err != nil {
-						log.Printf("archive: pushing %s: %v (is docker logged in?)", ref, err)
-					} else {
-						log.Printf("archive: pushed %s", ref)
-					}
+				if err := docker.TagImage(a.CleanImage(), ref); err != nil {
+					log.Printf("archive: tagging %s: %v - NOT pushed to the registry", ref, err)
+				} else if err := docker.Push(ref); err != nil {
+					log.Printf("archive: pushing %s: %v (is docker logged in?)", ref, err)
+				} else {
+					log.Printf("archive: pushed %s", ref)
 				}
 			}
 			// Only drift-check when no newer promote is queued: under
@@ -159,11 +160,25 @@ func (a *Archivist) Archive(version int, liveBackend func() string) {
 			// sending the next push through a needless clean rebase.
 			a.mu.Lock()
 			stale := a.pendingVersion != 0
+			a.skipped++
+			// Skipping while a newer promote is queued avoids comparing
+			// against an already-superseded version - but under a steady
+			// push stream that condition never clears, and the trust
+			// layer silently stops validating exactly when the app is
+			// changing fastest. Force a check every few rounds.
+			forced := a.skipped >= 5
+			if !stale || forced {
+				a.skipped = 0
+			}
 			a.mu.Unlock()
-			if stale {
-				log.Printf("archive: skipping drift check for v%d (newer promote queued)", version)
-			} else {
+			switch {
+			case !stale:
 				a.DriftCheck(liveBackend())
+			case forced:
+				log.Printf("archive: forcing a drift check for v%d after %d skipped rounds", version, 5)
+				a.DriftCheck(liveBackend())
+			default:
+				log.Printf("archive: skipping drift check for v%d (newer promote queued)", version)
 			}
 		}
 
