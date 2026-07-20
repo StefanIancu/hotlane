@@ -6,6 +6,9 @@ package pool
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -186,14 +189,29 @@ func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	// Snapshot: the fork's image is the live container's filesystem, warm
 	// caches included - unless a clean base was requested.
 	imageRef := p.imageRef(res.Version)
+	committed := false
 	if baseImage != "" {
 		imageRef = baseImage
 		res.FromClean = true
 		log.Printf("pool: forking v%d from clean image %s (drift recovery)", res.Version, baseImage)
 	} else if err := docker.Commit(p.Live, imageRef); err != nil {
 		return nil, err
+	} else {
+		committed = true
 	}
 	res.SnapshotMs = time.Since(start).Milliseconds()
+
+	// Every failure below this point must take the snapshot image with
+	// it. A rejected diff that leaves its image behind lets a loop of
+	// malformed pushes fill the disk with full filesystem copies -
+	// nothing else ever collects them (the ring only prunes promoted
+	// versions).
+	ok := false
+	defer func() {
+		if !ok && committed {
+			docker.RemoveImage(imageRef)
+		}
+	}()
 
 	// Patch: reset the shadow tree to pristine and apply the diff there,
 	// host-side, so the container image never needs git installed.
@@ -245,6 +263,7 @@ func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	p.LastFork = res
 	log.Printf("pool: fork %s ready at %s (snapshot %dms, patch %dms, boot %dms, total %dms)",
 		name, addr, res.SnapshotMs, res.PatchMs, res.BootMs, res.TotalMs)
+	ok = true // the image now belongs to the fork; Discard/prune own it
 	return res, nil
 }
 
@@ -494,7 +513,19 @@ type HeldFork struct {
 	Result    *ForkResult
 	ExpiresAt time.Time
 	SrcDir    string
-	proxy     *httputil.ReverseProxy
+	// Token makes the fork's address unguessable. Held forks are reached
+	// on the PUBLIC app listener (the whole point: poke them from a
+	// browser or an agent without credentials), so a bare version number
+	// would let anyone on the internet read unreleased code by counting
+	// to fifty.
+	Token string
+	proxy *httputil.ReverseProxy
+}
+
+// Header is the value a caller must send as X-Hotlane-Fork to reach
+// this fork.
+func (h *HeldFork) Header() string {
+	return fmt.Sprintf("%d-%s", h.Result.Version, h.Token)
 }
 
 // Hold registers a just-forked instance as held. Call under the same
@@ -518,24 +549,52 @@ func (p *Pool) Hold(res *ForkResult, ttl time.Duration) error {
 	if err := copyTree(p.ShadowDir(), src); err != nil {
 		return err
 	}
+	tok := make([]byte, 16)
+	if _, err := rand.Read(tok); err != nil {
+		return fmt.Errorf("generating fork token: %w", err)
+	}
 	p.held[res.Version] = &HeldFork{
 		Result:    res,
 		ExpiresAt: time.Now().Add(ttl),
 		SrcDir:    src,
+		Token:     hex.EncodeToString(tok),
 		proxy:     httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: res.Backend}),
 	}
 	log.Printf("pool: holding fork v%d at %s until %s", res.Version, res.Backend, p.held[res.Version].ExpiresAt.Format(time.RFC3339))
 	return nil
 }
 
-// HeldProxy returns the reverse proxy for a held fork, or nil.
-func (p *Pool) HeldProxy(version int) http.Handler {
+// HeldProxy resolves an X-Hotlane-Fork header value ("<version>-<token>")
+// to a held fork's reverse proxy, or nil. The token is compared in
+// constant time: this runs on the unauthenticated public traffic path,
+// so it is the only thing standing between a stranger and unreleased
+// code.
+func (p *Pool) HeldProxy(header string) http.Handler {
+	version, token, ok := strings.Cut(strings.TrimSpace(header), "-")
+	if !ok || token == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(version)
+	if err != nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if h, ok := p.held[version]; ok {
-		return h.proxy
+	h, ok := p.held[v]
+	if !ok {
+		return nil
 	}
-	return nil
+	if subtle.ConstantTimeCompare([]byte(token), []byte(h.Token)) != 1 {
+		return nil
+	}
+	return h.proxy
+}
+
+// Held returns a held fork by version, or nil.
+func (p *Pool) Held(version int) *HeldFork {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.held[version]
 }
 
 // HeldList summarizes held forks for status.
@@ -548,6 +607,10 @@ func (p *Pool) HeldList() []map[string]any {
 			"version":    v,
 			"backend":    h.Result.Backend,
 			"expires_at": h.ExpiresAt.UTC().Format(time.RFC3339),
+			// The status endpoint is authenticated, so returning the
+			// header here is how an agent that lost the test output
+			// recovers its fork address.
+			"header": h.Header(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["version"].(int) < out[j]["version"].(int) })

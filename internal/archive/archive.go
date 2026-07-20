@@ -197,16 +197,37 @@ func (a *Archivist) build() error {
 		df += fmt.Sprintf("RUN %s\n", a.Cfg.Build)
 	}
 	df += fmt.Sprintf("CMD [\"sh\", \"-c\", %q]\n", a.Cfg.RunCmd)
-	if err := os.WriteFile(filepath.Join(src, "Dockerfile"), []byte(df), 0o644); err != nil {
+	if err := writeNoFollow(filepath.Join(src, "Dockerfile"), []byte(df)); err != nil {
 		return err
 	}
 	// The snapshot may carry the app repo's .git; keep it out of the image.
-	if err := os.WriteFile(filepath.Join(src, ".dockerignore"), []byte(".git\nDockerfile\n"), 0o644); err != nil {
+	if err := writeNoFollow(filepath.Join(src, ".dockerignore"), []byte(".git\nDockerfile\n")); err != nil {
 		return err
 	}
 	buildSlots <- struct{}{}
 	defer func() { <-buildSlots }()
 	return docker.Build(src, a.CleanImage())
+}
+
+// writeNoFollow writes a file into the snapshot without ever following a
+// symlink at that path. The snapshot is built from a pushed diff, and
+// `git apply` will happily create `Dockerfile` as a symlink to anywhere
+// on the host - writing through it would let a push truncate arbitrary
+// files as the daemon user, which drives Docker and is usually root.
+func writeNoFollow(path string, data []byte) error {
+	// Remove unlinks the symlink itself, never its target.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // DriftCheck cold-boots the clean image and compares its behavior with the
@@ -289,13 +310,17 @@ func replayDrift(entries []replay.Entry, buffered int, coldAddr string, budget t
 	if res.Mismatched == 0 {
 		return ""
 	}
+	// This string is logged AND sent to the notify webhook, so it must
+	// carry no recorded traffic content - no bodies, no query strings.
+	// The endpoint and the counts are enough to act on; the bodies stay
+	// behind the authenticated API (`hotlane push`/`test` output).
 	m := res.Mismatches[0]
 	if m.WantStatus != m.GotStatus && m.GotStatus != 0 {
-		return fmt.Sprintf("replayed traffic differs on %s %s: live answered %d, clean build answers %d (%d/%d replayed requests differ)",
-			m.Method, m.Path, m.WantStatus, m.GotStatus, res.Mismatched, res.Replayed)
+		return fmt.Sprintf("replayed traffic differs on %s: live answered %d, clean build answers %d (%d/%d replayed requests differ)",
+			m.Endpoint(), m.WantStatus, m.GotStatus, res.Mismatched, res.Replayed)
 	}
-	return fmt.Sprintf("replayed traffic differs on %s %s: live served %q, clean build serves %q (%d/%d replayed requests differ)",
-		m.Method, m.Path, m.Want, m.Got, res.Mismatched, res.Replayed)
+	return fmt.Sprintf("replayed traffic differs on %s: response body differs from what live served (%d/%d replayed requests differ)",
+		m.Endpoint(), res.Mismatched, res.Replayed)
 }
 
 // compareResponses diffs the behavior of every http verify hook path

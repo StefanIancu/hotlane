@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -129,5 +131,67 @@ func TestCompareStatusStillMattersOnDynamicPath(t *testing.T) {
 	defer live.Close()
 	if d := compareResponses(cfgWith("/"), addr(cold), addr(live)); !strings.Contains(d, "answers") {
 		t.Errorf("status divergence not detected: %q", d)
+	}
+}
+
+// A pushed diff can make `Dockerfile` a symlink pointing anywhere on the
+// host; git apply permits it and cp -R preserves it. Writing through it
+// would let any push truncate arbitrary files as the daemon user.
+func TestWriteNoFollowRefusesToWriteThroughSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "HOST_SECRET")
+	if err := os.WriteFile(target, []byte("original host content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "snapshot")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(src, "Dockerfile")
+	if err := os.Symlink(target, planted); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeNoFollow(planted, []byte("FROM scratch\n")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	host, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(host) != "original host content" {
+		t.Errorf("HOST FILE OVERWRITTEN through the symlink: %q", host)
+	}
+	got, err := os.ReadFile(planted)
+	if err != nil || string(got) != "FROM scratch\n" {
+		t.Errorf("Dockerfile not written in place: %q %v", got, err)
+	}
+	if fi, err := os.Lstat(planted); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("path is still a symlink after write")
+	}
+}
+
+// Drift details are logged and POSTed to the notify webhook, so they
+// must never carry recorded user traffic.
+func TestReplayDriftDetailCarriesNoUserContent(t *testing.T) {
+	secretBody := `{"email":"alice@corp.com","balance":1420}`
+	entries := recordVia(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, secretBody) },
+		"/api/me?token=SECRETQUERYTOKEN&email=alice@corp.com")
+	cold := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"email":"bob@corp.com","balance":0}`)
+	}))
+	defer cold.Close()
+
+	detail := replayDrift(entries, 1, addr(cold), time.Second)
+	if detail == "" {
+		t.Fatal("expected drift to be reported")
+	}
+	for _, leak := range []string{"alice@corp.com", "bob@corp.com", "1420", "SECRETQUERYTOKEN", "token="} {
+		if strings.Contains(detail, leak) {
+			t.Errorf("drift detail leaks %q into logs/webhook:\n%s", leak, detail)
+		}
+	}
+	if !strings.Contains(detail, "/api/me") {
+		t.Errorf("detail should still name the endpoint:\n%s", detail)
 	}
 }

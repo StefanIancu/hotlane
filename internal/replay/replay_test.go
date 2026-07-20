@@ -294,3 +294,28 @@ func TestRunBudget(t *testing.T) {
 		t.Errorf("budget expiry counted as mismatch: %+v", res)
 	}
 }
+
+// Reset must clear recorded user data, not merely rewind the ring:
+// entries hold Authorization/Cookie headers and response bodies.
+func TestResetClearsRecordedData(t *testing.T) {
+	b := NewBuffer(4)
+	for i := 0; i < 4; i++ {
+		b.add(Entry{Path: "/p", Header: http.Header{"Authorization": []string{"Bearer supersecret"}},
+			Body: []byte("req-secret"), RespBody: []byte("resp-secret")})
+	}
+	b.Reset()
+	for i, e := range b.entries {
+		if e.Header != nil || e.Body != nil || e.RespBody != nil || e.Path != "" {
+			t.Errorf("slot %d still holds user data after Reset: %+v", i, e)
+		}
+	}
+}
+
+// Anything leaving the authenticated API must not carry query strings -
+// recorded ones hold tokens and email addresses.
+func TestMismatchEndpointStripsQuery(t *testing.T) {
+	m := Mismatch{Method: "GET", Path: "/reset?token=abc123&email=alice@corp.com"}
+	if got := m.Endpoint(); got != "GET /reset" {
+		t.Errorf("Endpoint() = %q, want %q", got, "GET /reset")
+	}
+}

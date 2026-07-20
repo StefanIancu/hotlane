@@ -88,12 +88,18 @@ perl -pi -e 's/"v3"/"v3t"/' server.js
 OUT="$("$BIN" test)" || fail "test rejected: $OUT"
 HV=$(echo "$OUT" | grep -oE "HELD v[0-9]+" | grep -oE "[0-9]+")
 [ -n "$HV" ] || fail "no HELD version in: $OUT"
+# The fork address is <version>-<token>; the bare version must NOT work,
+# or anyone on the internet could read unreleased code by counting.
+HDR=$(echo "$OUT" | grep -oE "X-Hotlane-Fork: [0-9]+-[0-9a-f]+" | sed 's/X-Hotlane-Fork: //')
+[ -n "$HDR" ] || fail "no tokenized fork header in: $OUT"
 expect_body "http://$PROXY/" "hello from demo-app v3"
-FORK_BODY=$(curl -s -H "X-Hotlane-Fork: $HV" "http://$PROXY/")
+FORK_BODY=$(curl -s -H "X-Hotlane-Fork: $HDR" "http://$PROXY/")
 [ "$FORK_BODY" = "hello from demo-app v3t" ] || fail "fork body wrong: $FORK_BODY"
+curl -s -H "X-Hotlane-Fork: $HV" "http://$PROXY/" | grep -q "no held fork" || fail "bare version number reached a held fork - enumeration is possible"
+curl -s -H "X-Hotlane-Fork: $HV-deadbeefdeadbeefdeadbeefdeadbeef" "http://$PROXY/" | grep -q "no held fork" || fail "wrong token reached a held fork"
 "$BIN" promote "$HV" | grep -q "PROMOTED" || fail "promote of held fork failed"
 expect_body "http://$PROXY/" "hello from demo-app v3t"
-curl -s -H "X-Hotlane-Fork: $HV" "http://$PROXY/" | grep -q "no held fork" || fail "promoted fork still routable as held"
+curl -s -H "X-Hotlane-Fork: $HDR" "http://$PROXY/" | grep -q "no held fork" || fail "promoted fork still routable as held"
 
 step "test: discard a held fork, nothing changes"
 perl -pi -e 's/"v3t"/"v3x"/' server.js

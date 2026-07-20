@@ -175,6 +175,24 @@ func cmdInit(args []string) {
 	fmt.Println("review it - especially the verify hooks - then run: hotlane serve")
 }
 
+// loopbackOnly reports whether a listen address can only be reached from
+// this machine. An empty host (":7433") means every interface, which is
+// the dangerous default this guards.
+func loopbackOnly(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = strings.TrimSuffix(addr, ":")
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // dataRoot is where the daemon keeps per-app state: ~/.hotlane normally,
 // /var/lib/hotlane when there is no home directory (systemd services with
 // DynamicUser or no User= often run without $HOME).
@@ -201,6 +219,16 @@ func cmdServe(args []string) {
 	}
 	if (*tlsDomain != "" || *tlsOn) && *token == "" {
 		log.Fatal("hotlane: TLS exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
+	}
+	// The API deploys code: reaching it is equivalent to running commands
+	// on this host. Binding it anywhere but loopback without a token
+	// would put an unauthenticated deploy endpoint on the network, so
+	// refuse rather than warn.
+	if *token == "" && !loopbackOnly(*apiAddr) {
+		log.Fatalf("hotlane: -addr %q binds beyond loopback and no -token is set - that would expose an\n"+
+			"unauthenticated deploy API (anyone who reaches it can run code on this host).\n"+
+			"  either: hotlane serve -addr 127.0.0.1:7433        (local only, no token needed)\n"+
+			"  or:     hotlane serve -token \"$(openssl rand -hex 24)\"", *apiAddr)
 	}
 
 	// One config (traditional) or a directory of them (multi-app).

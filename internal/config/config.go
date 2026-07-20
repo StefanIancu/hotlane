@@ -202,6 +202,9 @@ func LoadDir(dir string) ([]*Config, error) {
 	return configs, nil
 }
 
+// appName is the charset the docs promise and the router requires.
+var appName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // interpolate expands ${VAR} from the daemon's environment in the fields
@@ -234,6 +237,13 @@ func (c *Config) validate() error {
 	var problems []string
 	if c.App == "" {
 		problems = append(problems, "app: name is required")
+	} else if !appName.MatchString(c.App) {
+		// The name becomes a container name AND an API route pattern
+		// (/-/v1/apps/<app>/...). An unconstrained name can register a
+		// ServeMux wildcard that swallows every other app's routes, or
+		// crash the daemon at startup - so constrain it here, where the
+		// error is a clear config message.
+		problems = append(problems, fmt.Sprintf("app: %q must match ^[a-z0-9][a-z0-9-]*$ (lowercase letters, digits, dashes)", c.App))
 	}
 	if c.Image == "" {
 		problems = append(problems, "image: base image is required")

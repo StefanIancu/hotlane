@@ -44,12 +44,34 @@ replay:
   so replay adds ZERO extra load on live.
 - Memory only, never disk: the buffer holds real user data; it dies with
   the process and is never archived. Default caps: 512 requests, 64KB
-  body each, sampled 1-in-N under load if the ring churns too fast.
+  body each; oversized exchanges are forwarded untouched but not
+  recorded. Flips (promote/rollback) clear the ring outright - entries
+  are zeroed, not just rewound, so a quiet app does not keep a full ring
+  of credentials resident in memory.
 - Auth headers are kept (in memory) and replayed as-is - the fork is the
   same app with the same secrets; stripping them would make every
   replayed request a 401 and the whole feature would test the login page.
-- Only `methods:` are captured (default GET/HEAD). Excluded paths and
-  the `/-/` API prefix are never recorded.
+- Only `methods:` are captured (default GET/HEAD), minus `exclude:`
+  paths. On the shared TLS listener the `/-/` API prefix routes to the
+  API before app traffic, so daemon calls are not recorded; a client
+  that mistakenly aims API calls at the *proxy* port would be.
+
+### Where recorded data may travel
+
+This matters more than the buffer's own lifetime, because derived
+excerpts outlive it:
+
+- **Authenticated API only**: response-body excerpts (`replay.mismatches[].want/got`)
+  appear in the `push`/`test` response and CLI output. Whoever can deploy
+  can therefore read fragments of responses served to real users - worth
+  knowing if deploy rights and data-access rights differ in your team.
+- **Never leaves the API**: nothing carrying recorded bodies or query
+  strings goes to the daemon log, the notify webhook, or the drift
+  detail. Those name the endpoint (method + path, query stripped) and
+  counts only - deliberately, since webhooks are third parties and logs
+  get shipped.
+- **Never on disk**: no recorded traffic reaches snapshots, archived
+  images, or the state directory.
 
 ## Replay
 

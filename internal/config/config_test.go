@@ -186,3 +186,19 @@ func TestLoadDirMissingSrcDir(t *testing.T) {
 		t.Errorf("want missing-src error, got %v", err)
 	}
 }
+
+// The app name becomes an API route pattern, where "{x}" would register
+// a ServeMux wildcard that swallows every other app's routes, and ".."
+// or a space crashes the daemon at startup.
+func TestAppNameCharsetEnforced(t *testing.T) {
+	for _, bad := range []string{"{x}", "{x...}", "..", "a b", "UPPER", "under_score", "-lead", "sla/sh"} {
+		if _, err := load(t, strings.Replace(base, "app: demo", "app: "+"\""+bad+"\"", 1)); err == nil {
+			t.Errorf("app name %q accepted", bad)
+		}
+	}
+	for _, ok := range []string{"demo", "api2", "my-app", "a"} {
+		if _, err := load(t, strings.Replace(base, "app: demo", "app: "+ok, 1)); err != nil {
+			t.Errorf("app name %q rejected: %v", ok, err)
+		}
+	}
+}

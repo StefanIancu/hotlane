@@ -71,6 +71,13 @@ func (b *Buffer) add(e Entry) {
 func (b *Buffer) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Clear the entries, don't just rewind: they hold real user headers
+	// (Authorization, Cookie) and bodies, and a quiet app would otherwise
+	// keep a full ring of them resident - visible in a core dump or swap
+	// long after the traffic they describe.
+	for i := range b.entries {
+		b.entries[i] = Entry{}
+	}
 	b.next, b.full = 0, false
 }
 
@@ -202,6 +209,15 @@ type Mismatch struct {
 	GotStatus  int    `json:"got_status"`
 	Want       string `json:"want,omitempty"` // normalized, truncated
 	Got        string `json:"got,omitempty"`
+}
+
+// Endpoint names the mismatching request without its query string. Use
+// this - never Path, Want or Got - for anything that leaves the
+// authenticated API: logs, webhooks, drift details. Recorded traffic is
+// real user traffic, and query strings carry tokens and email addresses
+// as routinely as bodies carry personal data.
+func (m Mismatch) Endpoint() string {
+	return m.Method + " " + pathOnly(m.Path)
 }
 
 // Result is one replay run's verdict, attached to push/test responses.

@@ -116,14 +116,14 @@ func (a *appRuntime) trafficHandler() http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fv := r.Header.Get("X-Hotlane-Fork"); fv != "" {
-			n, err := strconv.Atoi(fv)
-			if err == nil {
-				if h := a.pool.HeldProxy(n); h != nil {
-					h.ServeHTTP(w, r)
-					return
-				}
+			if h := a.pool.HeldProxy(fv); h != nil {
+				h.ServeHTTP(w, r)
+				return
 			}
-			http.Error(w, "hotlane: no held fork "+fv+" (expired, promoted, or discarded?)", http.StatusMisdirectedRequest)
+			// Deliberately identical for "no such fork" and "wrong
+			// token": this path is unauthenticated, so the response
+			// must not confirm that a version exists.
+			http.Error(w, "hotlane: no held fork for that X-Hotlane-Fork value (expired, promoted, discarded, or wrong token?)", http.StatusMisdirectedRequest)
 			return
 		}
 		live.ServeHTTP(w, r)
@@ -292,9 +292,11 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 	// before it takes over. gate mode treats a mismatch exactly like a
 	// failing verify hook; report mode promotes and tells the truth.
 	if out.Replay = a.runReplay(res.Backend); out.Replay != nil && out.Replay.Mismatched > 0 {
-		detail := fmt.Sprintf("v%d: %d/%d replayed requests answered differently (e.g. %s %s)",
+		// Endpoint(), not Path: this goes to the webhook, and recorded
+		// query strings carry user tokens and email addresses.
+		detail := fmt.Sprintf("v%d: %d/%d replayed requests answered differently (e.g. %s)",
 			res.Version, out.Replay.Mismatched, out.Replay.Replayed,
-			out.Replay.Mismatches[0].Method, out.Replay.Mismatches[0].Path)
+			out.Replay.Mismatches[0].Endpoint())
 		a.notif.Send(notify.EventReplayMismatch, detail)
 		if a.cfg.Replay.Gate() {
 			out.Promoted = false
@@ -359,11 +361,12 @@ func (a *appRuntime) handleTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	held := a.pool.Held(res.Version)
 	json.NewEncoder(w).Encode(map[string]any{
 		"fork":       out,
 		"held":       true,
 		"expires_in": a.holdTTL.String(),
-		"header":     fmt.Sprintf("X-Hotlane-Fork: %d", res.Version),
+		"header":     "X-Hotlane-Fork: " + held.Header(),
 	})
 }
 

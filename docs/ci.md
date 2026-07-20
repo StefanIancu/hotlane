@@ -193,10 +193,12 @@ Teams keeping a managed platform for prod can split the loops: hotlane on a chea
 
 `-tls-domain` / `-tls` refuse to start without a token; tokens are compared in constant time; only `/-/healthz` is unauthenticated (and on a multi-app daemon it reports a count, never app names). App traffic on `https://yourdomain/` is untouched by any of this - it is your public app.
 
-Two things to know rather than discover:
+Things to know rather than discover:
 
-- **The daemon needs the Docker socket.** Anything that can talk to Docker can root the box, so treat the hotlane user as root-equivalent and the API token as a root credential. Keep the API on loopback (or a private network) unless you have a reason not to; `-tls` exists for when CI must reach it across the internet.
-- **Traffic replay buffers real user data in memory**, request headers included - stripping auth would make every replayed request a 401 and the feature useless. It is memory-only, capped, never written to disk, never archived, and dies with the process. If your traffic is sensitive enough that this matters, use `exclude:` for those paths or leave `replay:` off (it is off by default).
+- **The daemon needs the Docker socket.** Anything that can talk to Docker can root the box, so treat the hotlane user as root-equivalent and the API token as a root credential.
+- **The API refuses to bind beyond loopback without a token.** `hotlane serve` with no `-token` only listens on `127.0.0.1`; binding a public interface (or enabling TLS) requires one. The API deploys code, so an open one is remote code execution - the daemon will not let you start it that way by accident.
+- **Held forks are addressed by an unguessable token**, not their version number: `X-Hotlane-Fork: 7-3f9a...`. Fork traffic rides the *public* app listener by design (that is what makes previews and agent pokes work without credentials), so the address has to carry its own secret - otherwise counting to fifty would read your unreleased code. Wrong token and unknown fork return the same 421, so the endpoint is not an existence oracle.
+- **Traffic replay buffers real user data in memory**, request headers included - stripping auth would make every replayed request a 401 and the feature useless. It is memory-only, capped, cleared on every traffic flip, never written to disk. Recorded bodies and query strings never reach the daemon log, the notify webhook, or drift details (those get endpoint + counts); they appear only in the authenticated `push`/`test` response, which means whoever can deploy can read fragments of real user responses. If that is the wrong boundary for your team, use `exclude:` or leave `replay:` off - it is off by default.
 
 ## Running the daemon under systemd
 

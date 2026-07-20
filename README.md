@@ -115,7 +115,7 @@ hotlane serve        # run the daemon (-token / -tls-domain to expose safely;
                      #   -apps DIR serves every config in a directory, -tls certs them all)
 hotlane push         # git delta -> verified running fork -> traffic flip (~1-2s)
 hotlane test         # like push, but HOLD the verified fork: poke it via the
-                     #   X-Hotlane-Fork header, then promote or discard it
+                     #   X-Hotlane-Fork header (tokenized), then promote or discard it
 hotlane promote <n>  # flip traffic to a held fork - byte-identical to what you tested
 hotlane discard <n>  # destroy a held fork; live traffic never knew
 hotlane rollback [n] # flip to the previous (or a specific) kept version
