@@ -6,7 +6,7 @@ const { execFileSync } = require("child_process");
 
 // The daemon/CLI release this wrapper fetches. Deliberately decoupled from
 // the package version so wrapper-only fixes don't require binary releases.
-const BINARY_VERSION = "0.7.1";
+const BINARY_VERSION = "0.7.2";
 
 const OS = { darwin: "darwin", linux: "linux" }[process.platform];
 const ARCH = { x64: "amd64", arm64: "arm64" }[process.arch];
