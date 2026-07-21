@@ -228,6 +228,10 @@ Services run without `$HOME`, so the daemon keeps its state (fork ring, clean-im
 
 Hosting several apps on the box? Point the unit at a config directory instead: `ExecStart=/usr/local/bin/hotlane serve -apps /etc/hotlane/apps -tls`, one `*.yml` per app (each with `src:` and `domain:`), no `WorkingDirectory` needed. One unit, one token, every app.
 
+## Provisioning a fresh VPS with cloud-init
+
+Skip all of the above on a new box: paste [`packaging/cloud-init/user-data.yml`](../packaging/cloud-init/user-data.yml) into the "user data" field when creating a VM on any provider (Ubuntu/Debian images). First boot installs Docker and hotlane (checksum-verified), generates the API token into `/etc/hotlane/env`, and installs the systemd unit; the login banner then walks you through the first app - clone to `/srv/app`, `hotlane init`, `systemctl enable --now hotlane` - and the laptop-side remote-push setup, including the SSH-tunnel fallback for providers whose default firewall closes 7433/7480.
+
 ## Where the trust guarantees live
 
 Nothing about CI integration weakens the model: a push from CI goes through the same fork-verify-flip gate as a local one, the ring keeps instant rollback, and the archivist still produces the registry-pushed, from-source image for every promoted version plus behavioral drift checks against it. Your pipeline gets faster; the audit trail stays.

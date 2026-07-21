@@ -1,0 +1,112 @@
+#cloud-config
+# hotlane VPS bootstrap.
+#
+# Paste this file into the "user data" box when creating a VM on any
+# provider (DigitalOcean, Hetzner, EC2, Linode, ...) running Ubuntu or
+# Debian. It installs Docker and hotlane, generates an API token, and
+# installs a systemd unit - but does NOT start the daemon: a daemon with
+# zero apps has nothing to serve, and the first-app steps land in the
+# login banner instead. Log in and follow them; you'll be pushing in
+# about two minutes.
+#
+# What this sets up:
+#   /usr/local/bin/hotlane        the binary (latest release, checksummed)
+#   /etc/hotlane/env              HOTLANE_TOKEN=<random>  (mode 600)
+#   /etc/systemd/system/hotlane.service   serves the app at /srv/app
+#   /srv/                         where your app checkout lives
+
+package_update: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /etc/systemd/system/hotlane.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=hotlane - instant verified deploys
+      Documentation=https://hotlane.dev
+      After=network-online.target docker.service
+      Wants=network-online.target
+      Requires=docker.service
+      # A broken config must fail fast, not flap forever.
+      StartLimitIntervalSec=60
+      StartLimitBurst=5
+
+      [Service]
+      EnvironmentFile=/etc/hotlane/env
+      # With a token set, the API binds all interfaces (:7433) so your
+      # laptop and CI can push remotely (open that port in your
+      # provider's firewall, or use the SSH tunnel from the login
+      # banner). App traffic serves on :7480.
+      #
+      # Serving HTTPS instead: add "domain: your.domain" to
+      # /srv/app/hotlane.yml, point DNS here, open 443/80, and append
+      # -tls to ExecStart - the app moves to https://your.domain/ with
+      # the API under /-/ .
+      #
+      # Growing to several apps on this box: switch to
+      #   ExecStart=/usr/local/bin/hotlane serve -apps /etc/hotlane/apps
+      # with one <app>.yml per app in that directory - each needs
+      # src: and domain: (multi-app traffic routes by Host header).
+      ExecStart=/usr/local/bin/hotlane serve -config /srv/app/hotlane.yml
+      Restart=on-failure
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/update-motd.d/99-hotlane
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      if ! systemctl is-active --quiet hotlane; then
+        cat <<'EOF'
+
+      == hotlane is installed but not serving yet (no app configured) ==
+
+      First app, on this box:
+        git clone https://github.com/you/yourapp /srv/app
+        cd /srv/app && hotlane init     # detects the stack, writes hotlane.yml
+                                        # (skipped if your repo already has one)
+        systemctl enable --now hotlane  # builds the baseline, serves on :7480
+
+      Then, from your laptop:
+        export HOTLANE_DAEMON=http://THIS_BOX_IP:7433
+        export HOTLANE_TOKEN=<from: sudo cat /etc/hotlane/env>
+        hotlane status                  # then: edit code, hotlane push
+
+      Ports 7433/7480 closed in your provider's firewall? Either open
+      them, or tunnel: ssh -f -N -L 7433:127.0.0.1:7433 this-box
+      and use HOTLANE_DAEMON=http://127.0.0.1:7433 instead.
+
+      Docs: https://hotlane.dev/docs   Full contract: https://hotlane.dev/llms-full.txt
+      EOF
+      fi
+
+runcmd:
+  # Docker via the official convenience script (idempotent on re-run).
+  - [ sh, -c, "command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh" ]
+  # hotlane binary: latest release for this arch, checksum-verified.
+  - [ sh, -c, "set -e;
+      case \"$(uname -m)\" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) echo unsupported arch; exit 1;; esac;
+      cd /tmp;
+      curl -fsSLO https://github.com/StefanIancu/hotlane/releases/latest/download/hotlane_linux_${arch}.tar.gz;
+      curl -fsSLO https://github.com/StefanIancu/hotlane/releases/latest/download/checksums.txt;
+      grep hotlane_linux_${arch}.tar.gz checksums.txt | sha256sum -c -;
+      tar -xzf hotlane_linux_${arch}.tar.gz hotlane;
+      install -m 0755 hotlane /usr/local/bin/hotlane;
+      rm -f hotlane hotlane_linux_${arch}.tar.gz checksums.txt" ]
+  # API token: generated here, stored root-only, never echoed to the
+  # console log (provider panels keep those forever).
+  - [ sh, -c, "set -e;
+      mkdir -p /etc/hotlane /srv;
+      if [ ! -f /etc/hotlane/env ]; then
+        umask 077;
+        printf 'HOTLANE_TOKEN=%s\\n' \"$(head -c 24 /dev/urandom | od -vAn -tx1 | tr -d ' \\n')\" > /etc/hotlane/env;
+      fi" ]
+  # Enabled so it survives reboots once started; started by the user
+  # after the first app lands.
+  - [ sh, -c, "systemctl daemon-reload && systemctl enable hotlane" ]
