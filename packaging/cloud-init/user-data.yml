@@ -54,6 +54,9 @@ write_files:
       ExecStart=/usr/local/bin/hotlane serve -config /srv/app/hotlane.yml
       Restart=on-failure
       RestartSec=2
+      # serve exits 2 on configuration errors (bad flags, invalid
+      # hotlane.yml) - those will not fix themselves, so don't retry.
+      RestartPreventExitStatus=2
 
       [Install]
       WantedBy=multi-user.target

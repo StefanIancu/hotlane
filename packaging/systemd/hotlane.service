@@ -16,6 +16,9 @@ Documentation=https://hotlane.dev
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+# A broken config must fail fast, not flap forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 User=hotlane
@@ -29,6 +32,9 @@ EnvironmentFile=/etc/hotlane/env
 ExecStart=/usr/local/bin/hotlane serve
 Restart=on-failure
 RestartSec=2
+# serve exits 2 on configuration errors (bad flags, invalid
+# hotlane.yml) - those will not fix themselves, so don't retry them.
+RestartPreventExitStatus=2
 StateDirectory=hotlane
 
 # Uncomment when using -tls-domain: binding :443/:80 as non-root.

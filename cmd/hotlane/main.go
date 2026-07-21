@@ -175,6 +175,16 @@ func cmdInit(args []string) {
 	fmt.Println("review it - especially the verify hooks - then run: hotlane serve")
 }
 
+// fatalConfig reports a configuration error and exits with status 2 -
+// distinct from runtime failures (exit 1) so a supervisor can skip
+// hopeless restarts: a bad flag or config file will not fix itself, but
+// a Docker daemon that is still booting might. The shipped systemd unit
+// sets RestartPreventExitStatus=2 to match.
+func fatalConfig(format string, args ...any) {
+	log.Printf(format, args...)
+	os.Exit(2)
+}
+
 // loopbackOnly reports whether a listen address can only be reached from
 // this machine. An empty host (":7433") means every interface, which is
 // the dangerous default this guards.
@@ -228,17 +238,17 @@ func cmdServe(args []string) {
 	}
 
 	if *appsDir != "" && *tlsDomain != "" {
-		log.Fatal("hotlane: -tls-domain is single-app shorthand; with -apps, set domain: in each config and use -tls")
+		fatalConfig("hotlane: -tls-domain is single-app shorthand; with -apps, set domain: in each config and use -tls")
 	}
 	if (*tlsDomain != "" || *tlsOn) && *token == "" {
-		log.Fatal("hotlane: TLS exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
+		fatalConfig("hotlane: TLS exposes the API publicly; a -token (or HOTLANE_TOKEN) is required with it")
 	}
 	// The API deploys code: reaching it is equivalent to running commands
 	// on this host. Binding it anywhere but loopback without a token
 	// would put an unauthenticated deploy endpoint on the network, so
 	// refuse rather than warn.
 	if *token == "" && !loopbackOnly(*apiAddr) {
-		log.Fatalf("hotlane: -addr %q binds beyond loopback and no -token is set - that would expose an\n"+
+		fatalConfig("hotlane: -addr %q binds beyond loopback and no -token is set - that would expose an\n"+
 			"unauthenticated deploy API (anyone who reaches it can run code on this host).\n"+
 			"  either: hotlane serve                             (default binds loopback, no token needed)\n"+
 			"  or:     hotlane serve -addr %s -token \"$(openssl rand -hex 24)\"", *apiAddr, *apiAddr)
@@ -249,19 +259,19 @@ func cmdServe(args []string) {
 	if *appsDir != "" {
 		var err error
 		if cfgs, err = config.LoadDir(*appsDir); err != nil {
-			log.Fatalf("hotlane: %v", err)
+			fatalConfig("hotlane: %v", err)
 		}
 	} else {
 		cfg, err := config.Load(*cfgPath)
 		if err != nil {
-			log.Fatalf("hotlane: %v", err)
+			fatalConfig("hotlane: %v", err)
 		}
 		// The source checkout: src: from the config when set (Load already
 		// resolved it against the config's directory), else the config's
 		// directory itself - serve traditionally starts inside the repo.
 		if cfg.Src == "" {
 			if cfg.Src, err = filepath.Abs(filepath.Dir(*cfgPath)); err != nil {
-				log.Fatalf("hotlane: %v", err)
+				fatalConfig("hotlane: %v", err)
 			}
 		}
 		if *tlsDomain != "" {
@@ -472,7 +482,7 @@ func cmdServe(args []string) {
 			}
 		}
 		if len(domains) == 0 {
-			log.Fatal("hotlane: -tls needs at least one app with domain: set")
+			fatalConfig("hotlane: -tls needs at least one app with domain: set")
 		}
 		mgr := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
