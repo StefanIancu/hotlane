@@ -246,7 +246,19 @@ func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	imageRef := p.imageRef(res.Version)
 	committed := false
 	if baseImage != "" {
-		imageRef = baseImage
+		// The fork must own a per-version reference to its base. The
+		// archivist rebuilds the :clean tag on every promote, and on
+		// Docker's containerd image store (the default on fresh installs
+		// since Docker 28) the untagged previous image gets garbage
+		// collected - after which every `docker commit` of this container
+		// fails with "content digest not found", permanently breaking
+		// pushes after any drift recovery or auto-rebase. The version tag
+		// pins the base for exactly as long as the version lives; prune
+		// and Discard already remove it.
+		if err := docker.TagImage(baseImage, imageRef); err != nil {
+			return nil, fmt.Errorf("pinning clean base for v%d: %w", res.Version, err)
+		}
+		committed = true
 		res.FromClean = true
 		log.Printf("pool: forking v%d from clean image %s (drift recovery)", res.Version, baseImage)
 	} else if err := docker.Commit(p.Live, imageRef); err != nil {
