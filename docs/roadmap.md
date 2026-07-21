@@ -1,6 +1,6 @@
 # Roadmap
 
-Last updated: 2026-07-20 (v0.7.1).
+Last updated: 2026-07-21 (v0.7.2).
 
 ## Shipped
 
@@ -27,6 +27,8 @@ Last updated: 2026-07-20 (v0.7.1).
 **v0.7.0** - 24 fixes from an adversarial bug hunt (four parallel subsystem reviews, a race soak, and a 40-push steady-state run). The worst: a rollback undone by an in-flight push, the TTL reaper destroying a held fork mid-promote, missing docker timeouts letting `commit --pause` freeze the live instance, replay breaking websockets/SSE, the replay gate bypassed by a hung fork, and an MCP string version triggering an unrequested rollback. The e2e suite grew to 27 scenarios including three dedicated race reproductions.
 
 **v0.7.1** - the last known minors, plus first-contact polish from a fresh-eyes dogfooding session. Prune retains versions by how recently they were live (a new persisted `live-history`), not by number - a rollback no longer marks the known-good version for pruning while keeping the bad one; the same history powers an orphan reaper that collects forks stranded running by a crash in promote's marker-clear window (or mid-verify). Replay preserves the recorded `Host` header instead of sending the fork's loopback hostport, and its counts are disjoint (`replayed = matched + dynamic + mismatched`) as the docs always claimed. First-contact: bare `hotlane serve` now works - the API binds loopback by default (all-interfaces stays the default when a token is set, so tokened deployments are unchanged), the startup banner names each listener's role with a clickable URL, and the API root answers with directions instead of a 404. The e2e suite runs on its own ports and kills only its own daemons, so it coexists with a hotlane being dogfooded on the same machine.
+
+**v0.7.2** - two fixes for how hotlane actually gets run in 2026. On Docker's containerd image store (the default on fresh installs), the archivist rebuilding `:clean` untagged a from-clean fork's base image and containerd garbage-collected it - after which every `docker commit` of that container failed and one drift recovery (or one ~40-push auto-rebase) permanently broke pushing; from-clean forks now pin their base with the version tag, verified by replaying the exact failure on a fresh Docker 29 box. And `serve` exits 2 on configuration errors so supervisors stop retrying what cannot succeed - the shipped systemd and cloud-init units pair it with `RestartPreventExitStatus=2` and a start limit (one misconfigured daemon had quietly flapped 26,000 times).
 
 ## Next
 
