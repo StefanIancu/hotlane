@@ -20,7 +20,7 @@
     <a href="docs/roadmap.md">Roadmap</a>
   </p>
 
-  <img src="docs/demo.gif" alt="hotlane demo: edit, push, verified live in ~1s, rollback in ~700ms" width="720">
+  <img src="docs/demo.gif" alt="hotlane demo: edit, push - verified and replay-checked against live traffic, promoted in ~1s; rollback in ~500ms" width="720">
 </div>
 
 ## Why
