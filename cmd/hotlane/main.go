@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -185,6 +186,19 @@ func fatalConfig(format string, args ...any) {
 	os.Exit(2)
 }
 
+// fatalLoad exits 2 for config-content errors and 1 for environmental
+// ones (config.EnvError): a checkout on a mount that lands late, or a
+// config file unreadable during boot, heals on retry - the supervisor
+// must keep trying, and exit 2 would permanently down every app on the
+// box over a three-second race.
+func fatalLoad(err error) {
+	var env *config.EnvError
+	if errors.As(err, &env) {
+		log.Fatalf("hotlane: %v", err)
+	}
+	fatalConfig("hotlane: %v", err)
+}
+
 // loopbackOnly reports whether a listen address can only be reached from
 // this machine. An empty host (":7433") means every interface, which is
 // the dangerous default this guards.
@@ -259,12 +273,12 @@ func cmdServe(args []string) {
 	if *appsDir != "" {
 		var err error
 		if cfgs, err = config.LoadDir(*appsDir); err != nil {
-			fatalConfig("hotlane: %v", err)
+			fatalLoad(err)
 		}
 	} else {
 		cfg, err := config.Load(*cfgPath)
 		if err != nil {
-			fatalConfig("hotlane: %v", err)
+			fatalLoad(err)
 		}
 		// The source checkout: src: from the config when set (Load already
 		// resolved it against the config's directory), else the config's

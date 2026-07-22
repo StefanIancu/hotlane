@@ -253,6 +253,15 @@ func Build(dir, tag string) error {
 }
 
 // TagImage adds a tag to an existing image.
+// ContainerImageID returns the image ID a container was created from.
+func ContainerImageID(name string) (string, error) {
+	out, err := run("inspect", "-f", "{{.Image}}", name)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 func TagImage(src, dst string) error {
 	_, err := run("tag", src, dst)
 	return err

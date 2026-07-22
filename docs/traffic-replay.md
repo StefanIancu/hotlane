@@ -85,6 +85,18 @@ After verify hooks pass (and before promote/hold):
    A path that appears more than once in the buffer with differing
    normalized live bodies is self-dynamic: status-only comparison, same
    rule as drift checks.
+   The buffer can miss dynamism it never sampled twice - a path recorded
+   once, or a seconds counter recorded twice within the same tick - so
+   before such a body mismatch stands, the path is probed twice on the
+   fork itself, spaced just over a second apart (GET/HEAD/OPTIONS only,
+   one probe pair per path). If the fork's own body moves at the
+   recorded status, the path is reclassified dynamic: content that
+   varies under the fork's feet cannot be evidence against it. The
+   probes are strictly a tiebreak for paths the buffer lacks evidence
+   on: a path recorded with identical bodies over a second apart is
+   proven static, and a fork answering it nondeterministically keeps
+   its mismatch; a status flap between probes is instability, never
+   dynamism.
 4. Attach the result to the push/test response:
 
 ```json
@@ -102,6 +114,45 @@ After verify hooks pass (and before promote/hold):
 
 `hotlane test` composes naturally: hold the fork, replay against it, let
 the agent read the diff report before deciding promote/discard.
+
+## When gate mode will false-positive
+
+Replay compares the fork's answers against answers recorded *earlier*
+against *live's* state. Some legitimate differences between those two
+moments are indistinguishable from regressions, and gate mode will
+reject a correct push when they occur. Know them before turning the
+gate on:
+
+- **Shared mutable state.** If data changed between record time and
+  push time (a row added, a post edited), the fork's correct answer
+  differs from the recorded one - stably, so no rescue applies. Gate
+  mode fits read-mostly endpoints; for CRUD-heavy apps keep `mode:
+  report` or `exclude:` the data-driven paths.
+- **Sessions and short-lived credentials.** Recorded cookies and
+  tokens are replayed verbatim. In-process session stores (the fork
+  never issued those session IDs) and expired/single-use tokens (CSRF,
+  short-TTL JWTs) turn recorded 200s into legitimate 401/403s.
+- **Conditional requests.** Recorded `If-None-Match` /
+  `If-Modified-Since` headers can flip 304↔200 across a rebuild -
+  mtime-based ETags and Last-Modified change even for identical files.
+- **Proxy-aware apps.** Capture records the request as the client sent
+  it, before proxy headers are added, so the fork does not receive
+  `X-Forwarded-Proto`/`-For`. SSL-redirect middleware (Django
+  `SECURE_SSL_REDIRECT`, Rails `force_ssl`, Express `trust proxy`)
+  answers 301 where live answered 200; per-IP rate limiters see every
+  replayed request from one loopback address. Disable such middleware's
+  dependence on those headers, or exclude the affected paths.
+- **Content-Type is compared exactly.** A framework bump that changes
+  `text/html` to `text/html; charset=utf-8` mismatches every page. The
+  gate exists to catch what a push changes - this is one of them, but
+  it may be one you meant.
+- **Opted-in mutating methods** (`methods:` beyond GET/HEAD) get no
+  dynamic-content rescue at all, and a replayed mutation re-executes
+  against whatever state the fork shares. That is the loaded gun the
+  section below describes.
+
+The trust path stands: run `mode: report` for a week; if it stays
+quiet, your traffic is replay-clean and the gate will be too.
 
 ## Why not replay writes
 

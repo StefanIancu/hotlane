@@ -48,6 +48,16 @@ type Pool struct {
 
 	held map[int]*HeldFork // test-mode forks awaiting promote/discard
 
+	// inflight tracks fork versions whose fate is undecided: forked but
+	// not yet promoted, held, or discarded. A fork mid-verify is a
+	// running, never-live, unheld container - exactly what pruneOrder
+	// ranks first for removal - and prune runs asynchronously off a
+	// promote's deferred stop, so without this set a push racing the
+	// previous promote gets its fork force-removed mid-verify (or, if
+	// the prune lands between verify and promote, the proxy is flipped
+	// onto a container that no longer exists).
+	inflight map[int]bool
+
 	// BaselineCommit is the git commit the pristine snapshot was taken at
 	// (empty if the source is not a git checkout). Diffs are applied
 	// against pristine, so this is the commit CI clients diff from.
@@ -140,6 +150,7 @@ func (p *Pool) adopt(name string) error {
 	// must list everything that served - the orphan reaper destroys
 	// running containers it has never heard of.
 	p.recordLive(name)
+	p.pinBase(name, version)
 	// Versions are never reused, so the counter must clear every
 	// container that exists - not just the adopted one. After a rollback
 	// the live container is NOT the highest version (v4 is stopped in
@@ -157,6 +168,36 @@ func (p *Pool) adopt(name string) error {
 	p.recordNext(p.next)
 	log.Printf("pool: adopted %s (v%d) at %s, next version v%d", name, version, addr, p.next)
 	return nil
+}
+
+// pinBase ensures the image a container was created from still carries
+// this version's tag. Containers created before v0.7.2 forked directly
+// from the :clean tag; when the archivist rebuilds :clean their base
+// loses its last tag and Docker's containerd store garbage-collects it,
+// after which every docker commit of the container fails "content
+// digest not found". Adoption and rollback are the doors such a
+// container re-enters service through - tag its image ID on the way
+// in. Idempotent: when the version tag already exists (every fork made
+// on >=0.7.2) nothing happens. v1 has no snapshot image; tagging
+// cfg.Image's ID is a harmless extra name.
+func (p *Pool) pinBase(name string, version int) {
+	if version == 0 {
+		return
+	}
+	ref := p.imageRef(version)
+	if docker.ImageExists(ref) {
+		return
+	}
+	id, err := docker.ContainerImageID(name)
+	if err != nil {
+		log.Printf("pool: pinning base of %s: %v", name, err)
+		return
+	}
+	if err := docker.TagImage(id, ref); err != nil {
+		log.Printf("pool: pinning base of %s as %s: %v", name, ref, err)
+		return
+	}
+	log.Printf("pool: pinned base image of %s as %s (created before base pinning; protects it from containerd GC)", name, ref)
 }
 
 // highestVersion is the largest version number any container for this
@@ -328,6 +369,10 @@ func (p *Pool) Fork(diff []byte, baseImage string) (*ForkResult, error) {
 	res.BootMs = time.Since(bootStart).Milliseconds()
 	res.TotalMs = time.Since(start).Milliseconds()
 	p.LastFork = res
+	if p.inflight == nil {
+		p.inflight = map[int]bool{}
+	}
+	p.inflight[res.Version] = true
 	log.Printf("pool: fork %s ready at %s (snapshot %dms, patch %dms, boot %dms, total %dms)",
 		name, addr, res.SnapshotMs, res.PatchMs, res.BootMs, res.TotalMs)
 	ok = true // the image now belongs to the fork; Discard/prune own it
@@ -343,6 +388,7 @@ func (p *Pool) Promote(res *ForkResult) (old string) {
 	defer p.mu.Unlock()
 	old = p.Live
 	p.Live, p.Backend, p.Version = res.Container, res.Backend, res.Version
+	delete(p.inflight, res.Version)
 	p.recordLive(res.Container)
 	if old != "" && old != res.Container {
 		p.stopAsync(old, p.prune)
@@ -448,7 +494,7 @@ func (p *Pool) prune() {
 	defer p.mu.Unlock()
 	entries := make([]RingEntry, 0)
 	for _, e := range p.ring() {
-		if !e.Live {
+		if !e.Live && !p.inflight[e.Version] {
 			entries = append(entries, e)
 		}
 	}
@@ -557,6 +603,7 @@ func (p *Pool) Rollback(version int, ready func(container, backend string) error
 	old := p.Live
 	p.Live, p.Backend, p.Version = target.Container, addr, target.Version
 	p.recordLive(target.Container)
+	p.pinBase(target.Container, target.Version)
 	if old != "" {
 		p.stopAsync(old, nil)
 	}
@@ -571,6 +618,9 @@ func (p *Pool) Rollback(version int, ready func(container, backend string) error
 // pushes must not stack images on disk) and returns its last log lines
 // for the pusher.
 func (p *Pool) Discard(res *ForkResult) string {
+	p.mu.Lock()
+	delete(p.inflight, res.Version)
+	p.mu.Unlock()
 	logs := docker.Logs(res.Container, 50)
 	if err := docker.Remove(res.Container); err != nil {
 		log.Printf("pool: discarding %s: %v", res.Container, err)
@@ -670,6 +720,8 @@ func (p *Pool) Hold(res *ForkResult, ttl time.Duration) error {
 		Token:     hex.EncodeToString(tok),
 		proxy:     httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: res.Backend}),
 	}
+	// The held map protects it from prune now (ring() skips held forks).
+	delete(p.inflight, res.Version)
 	log.Printf("pool: holding fork v%d at %s until %s", res.Version, res.Backend, p.held[res.Version].ExpiresAt.Format(time.RFC3339))
 	return nil
 }
@@ -735,8 +787,37 @@ func (p *Pool) State() State {
 // silently overwrites the image for a different build.
 func (p *Pool) nextMarker() string { return filepath.Join(p.DataDir, "next-version") }
 
+// writeMarker persists small state files atomically: temp file in the
+// same directory, fsync, rename. The markers are the ground truth a
+// restart rebuilds serving state from - a torn in-place write that
+// leaves "hotlane-app-v1" from "hotlane-app-v12" parses as a
+// perfectly valid, catastrophically wrong value (the reaper would then
+// protect ancient v1 while destroying the real live v12).
+func writeMarker(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".marker-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
 func (p *Pool) recordNext(v int) {
-	if err := os.WriteFile(p.nextMarker(), []byte(strconv.Itoa(v)), 0o644); err != nil {
+	if err := writeMarker(p.nextMarker(), []byte(strconv.Itoa(v))); err != nil {
 		log.Printf("pool: recording next version: %v", err)
 	}
 }
@@ -757,7 +838,7 @@ func (p *Pool) liveMarker() string { return filepath.Join(p.DataDir, "live-conta
 
 // recordLive persists the current live container. Called on every flip.
 func (p *Pool) recordLive(name string) {
-	if err := os.WriteFile(p.liveMarker(), []byte(name), 0o644); err != nil {
+	if err := writeMarker(p.liveMarker(), []byte(name)); err != nil {
 		log.Printf("pool: recording live container: %v", err)
 	}
 	if v := versionFromName(name); v > 0 {
@@ -788,7 +869,7 @@ func (p *Pool) recordHistory(version int) {
 		kept++
 		fmt.Fprintf(&b, "%d\n", v)
 	}
-	if err := os.WriteFile(p.historyMarker(), []byte(b.String()), 0o644); err != nil {
+	if err := writeMarker(p.historyMarker(), []byte(b.String())); err != nil {
 		log.Printf("pool: recording live history: %v", err)
 	}
 }
@@ -855,6 +936,18 @@ func (p *Pool) reapHeldOnStart() {
 		docker.Remove(drift)
 	}
 
+	hist := p.liveHistory()
+	served := make(map[int]bool, len(hist))
+	for _, v := range hist {
+		served[v] = true
+	}
+	// Belt and braces: never touch the recorded live container, even if
+	// the history file was lost or hand-edited.
+	liveName := ""
+	if b, err := os.ReadFile(p.liveMarker()); err == nil {
+		liveName = strings.TrimSpace(string(b))
+	}
+
 	markers, _ := filepath.Glob(filepath.Join(p.DataDir, "held", "v*.held"))
 	for _, m := range markers {
 		var v int
@@ -862,6 +955,16 @@ func (p *Pool) reapHeldOnStart() {
 			continue
 		}
 		name := containerName(p.Cfg.App, v)
+		// A version that served traffic with its marker still on disk
+		// means PromoteHeld could not remove the marker (EIO, read-only
+		// fs) and promoted anyway. The marker is stale, the container is
+		// or was live - never destroy it, just clear the marker.
+		if name == liveName || served[v] {
+			log.Printf("pool: clearing stale held marker for v%d (it served traffic; promote could not remove the marker)", v)
+			os.Remove(m)
+			os.RemoveAll(filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", v)))
+			continue
+		}
 		if docker.Exists(name) {
 			log.Printf("pool: reaping fork v%d held when the daemon stopped (never promoted, never served traffic)", v)
 			docker.Remove(name)
@@ -875,32 +978,33 @@ func (p *Pool) reapHeldOnStart() {
 	// (PromoteHeld's window) leaves the fork RUNNING with no marker:
 	// not held, not live, never served - the marker loop above misses
 	// it and it pollutes the ring forever. A crash during a push's
-	// verify leaves the same signature. The live history lists every
-	// version that ever served, so any running container absent from
-	// it is such an orphan. An empty history means this daemon
+	// verify leaves the same signature, as does a fork whose container
+	// has since exited (crash loop, docker restart). The live history
+	// lists every version that ever served, so any container absent
+	// from it is such an orphan. An empty history means this daemon
 	// predates the record - skip rather than guess.
-	hist := p.liveHistory()
 	if len(hist) == 0 {
 		return
 	}
-	served := make(map[int]bool, len(hist))
-	for _, v := range hist {
-		served[v] = true
+	// The markers are written on every flip but a write can fail (disk
+	// full) with only a log line to show for it. If the recorded live
+	// container is not running, the records are suspect - the actual
+	// live may be a version they never heard of, and "orphan" would
+	// mean "the container serving your users". Refuse to reap on stale
+	// evidence; a wrong adoption is recoverable, a removed container is
+	// not.
+	if liveName == "" || !docker.IsRunning(liveName) {
+		log.Printf("pool: skipping orphan reap: recorded live %q is not running, markers may be stale", liveName)
+		return
 	}
-	// Belt and braces: never touch the recorded live container, even if
-	// the history file was lost or hand-edited.
-	liveName := ""
-	if b, err := os.ReadFile(p.liveMarker()); err == nil {
-		liveName = strings.TrimSpace(string(b))
-	}
-	running, _ := docker.Running(p.Cfg.App)
-	for _, name := range running {
-		v := versionFromName(name)
-		if v == 0 || served[v] || name == liveName {
+	infos, _ := docker.All(p.Cfg.App)
+	for _, in := range infos {
+		v := versionFromName(in.Name)
+		if v == 0 || served[v] || in.Name == liveName {
 			continue
 		}
-		log.Printf("pool: reaping orphaned fork %s (running but never served traffic - left by a crash)", name)
-		docker.Remove(name)
+		log.Printf("pool: reaping orphaned fork %s (never served traffic - left by a crash)", in.Name)
+		docker.Remove(in.Name)
 		docker.RemoveImage(p.imageRef(v))
 		os.RemoveAll(filepath.Join(p.DataDir, "held", fmt.Sprintf("v%d", v)))
 	}
@@ -949,8 +1053,12 @@ func (p *Pool) PromoteHeld(version int, ready func(container, backend string) er
 		}
 	}
 	// Clear the marker before the flip: from here on this container may
-	// be serving traffic, so a crash must leave it adoptable.
-	os.Remove(p.heldMarker(version))
+	// be serving traffic, so a crash must leave it adoptable. A failed
+	// removal is survivable - the startup reaper treats a marker whose
+	// version is in the live history as stale - but say so loudly.
+	if err := os.Remove(p.heldMarker(version)); err != nil && !os.IsNotExist(err) {
+		log.Printf("pool: clearing held marker v%d: %v (promoting anyway; the marker is stale from here on)", version, err)
+	}
 	p.Promote(h.Result)
 	p.mu.Lock()
 	delete(p.held, version)

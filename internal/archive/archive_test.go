@@ -77,6 +77,24 @@ func TestCompareSkipsSelfDynamicBody(t *testing.T) {
 	}
 }
 
+func TestCompareReprobesCoarseCounter(t *testing.T) {
+	// A seconds-grained counter answers the two back-to-back samples
+	// identically and looks static - old behavior called the cold/live
+	// difference drift. The spaced re-probe sees it move.
+	old := confirmDelay
+	confirmDelay = 20 * time.Millisecond
+	t.Cleanup(func() { confirmDelay = old })
+	// (n-1)/2 changes on the third request: static across a sample pair,
+	// moved by the time the re-probe asks.
+	cold := serve(func(n int) string { return fmt.Sprintf("%d", (n-1)/2) })
+	defer cold.Close()
+	live := serve(func(n int) string { return fmt.Sprintf("%d", 50+(n-1)/2) })
+	defer live.Close()
+	if d := compareResponses(cfgWith("/"), addr(cold), addr(live)); d != "" {
+		t.Errorf("coarse counter read as drift: %s", d)
+	}
+}
+
 // recordVia drives requests through a replay.Capture server to build a
 // realistic recorded slice.
 func recordVia(t *testing.T, h http.HandlerFunc, paths ...string) []replay.Entry {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,8 +183,30 @@ func TestLoadDirEmpty(t *testing.T) {
 
 func TestLoadDirMissingSrcDir(t *testing.T) {
 	dir := writeApps(t, map[string]string{"api.yml": "app: api\nimage: node:22-alpine\nrun: node server.js\nport: 3000\nsrc: ./nope\n"})
-	if _, err := LoadDir(dir); err == nil || !strings.Contains(err.Error(), "not a directory") {
-		t.Errorf("want missing-src error, got %v", err)
+	_, err := LoadDir(dir)
+	if err == nil || !strings.Contains(err.Error(), "not readable") {
+		t.Errorf("want unreadable-src error, got %v", err)
+	}
+	// A missing checkout is an environment problem - a mount landing a
+	// few seconds after boot heals on retry - so it must carry the
+	// retryable marker, not the permanent config-error classification.
+	var env *EnvError
+	if !errors.As(err, &env) {
+		t.Errorf("missing src not classified environmental: %v", err)
+	}
+}
+
+func TestLoadDirSrcIsAFile(t *testing.T) {
+	// src pointing at a file is wrong content, not a wrong moment:
+	// permanent, exit-2 class - retrying can never fix it.
+	dir := writeApps(t, map[string]string{"api.yml": "app: api\nimage: node:22-alpine\nrun: node server.js\nport: 3000\ndomain: api.example.com\nsrc: ./api.yml\n"})
+	_, err := LoadDir(dir)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("want not-a-directory error, got %v", err)
+	}
+	var env *EnvError
+	if errors.As(err, &env) {
+		t.Errorf("file-as-src wrongly classified environmental: %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,11 +125,21 @@ func (r *Replay) BudgetOrDefault() time.Duration {
 	return 5 * time.Second
 }
 
+// EnvError marks a load failure caused by the environment - a file or
+// directory not readable right now - rather than by the configuration's
+// content. The distinction picks the exit code: a mount that lands a
+// few seconds after boot fixes itself on retry (exit 1, supervisor
+// keeps trying), a parse error never does (exit 2, supervisor stops).
+type EnvError struct{ Err error }
+
+func (e *EnvError) Error() string { return e.Err.Error() }
+func (e *EnvError) Unwrap() error { return e.Err }
+
 // Load reads and validates a hotlane.yml.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, &EnvError{err}
 	}
 	var c Config
 	if err := yaml.Unmarshal(raw, &c); err != nil {
@@ -169,6 +180,7 @@ func LoadDir(dir string) ([]*Config, error) {
 	var (
 		configs  []*Config
 		problems []string
+		env      bool // any problem environmental → the whole load is retryable
 		byApp    = map[string]string{}
 		byDomain = map[string]string{}
 	)
@@ -176,6 +188,10 @@ func LoadDir(dir string) ([]*Config, error) {
 		name := filepath.Base(p)
 		c, err := Load(p)
 		if err != nil {
+			var envErr *EnvError
+			if errors.As(err, &envErr) {
+				env = true
+			}
 			problems = append(problems, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
@@ -194,13 +210,22 @@ func LoadDir(dir string) ([]*Config, error) {
 		}
 		if c.Src == "" {
 			problems = append(problems, fmt.Sprintf("%s: src: is required in a multi-app directory (the checkout to snapshot/diff against)", name))
-		} else if fi, err := os.Stat(c.Src); err != nil || !fi.IsDir() {
+		} else if fi, err := os.Stat(c.Src); err != nil {
+			// Environment, not content: the checkout may live on a mount
+			// that lands after this daemon starts.
+			env = true
+			problems = append(problems, fmt.Sprintf("%s: src %q is not readable: %v", name, c.Src, err))
+		} else if !fi.IsDir() {
 			problems = append(problems, fmt.Sprintf("%s: src %q is not a directory", name, c.Src))
 		}
 		configs = append(configs, c)
 	}
 	if len(problems) > 0 {
-		return nil, fmt.Errorf("invalid app directory %s:\n  %s", dir, strings.Join(problems, "\n  "))
+		err := fmt.Errorf("invalid app directory %s:\n  %s", dir, strings.Join(problems, "\n  "))
+		if env {
+			return nil, &EnvError{err}
+		}
+		return nil, err
 	}
 	return configs, nil
 }

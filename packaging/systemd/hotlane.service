@@ -16,9 +16,13 @@ Documentation=https://hotlane.dev
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
-# A broken config must fail fast, not flap forever.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# No StartLimit here on purpose: exit 2 (config errors, matched by
+# RestartPreventExitStatus below) already stops the hopeless retries.
+# A start limit would do the opposite - a FAST transient failure loop
+# (registry unreachable for the first 30s of boot) trips the limit and
+# permanently downs the daemon, while retrying two seconds later would
+# have healed it. Fail fast on what cannot fix itself, retry forever on
+# what can.
 
 [Service]
 User=hotlane

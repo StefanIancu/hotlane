@@ -31,9 +31,10 @@ write_files:
       After=network-online.target docker.service
       Wants=network-online.target
       Requires=docker.service
-      # A broken config must fail fast, not flap forever.
-      StartLimitIntervalSec=60
-      StartLimitBurst=5
+      # No StartLimit on purpose: exit 2 (config errors) already stops
+      # hopeless retries via RestartPreventExitStatus, and a start
+      # limit would permanently down the box on a fast transient
+      # failure loop (registry unreachable during early boot).
 
       [Service]
       EnvironmentFile=/etc/hotlane/env

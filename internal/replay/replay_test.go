@@ -1,11 +1,13 @@
 package replay
 
 import (
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -137,6 +139,233 @@ func TestRunSelfDynamicComparesStatusOnly(t *testing.T) {
 	// Mismatched): a dynamic entry must not also count as Matched.
 	if res.Matched != 0 || res.Matched+res.Dynamic+res.Mismatched != res.Replayed {
 		t.Errorf("counts not disjoint: %+v", res)
+	}
+}
+
+// shortConfirm shrinks the spaced-probe delay so tests exercising the
+// confirm pass stay fast; the handlers below move per request, not per
+// second, so any spacing catches them.
+func shortConfirm(t *testing.T) {
+	t.Helper()
+	old := confirmDelay
+	confirmDelay = 20 * time.Millisecond
+	t.Cleanup(func() { confirmDelay = old })
+}
+
+func TestRunReclassifiesSingleSampleCounterAsDynamic(t *testing.T) {
+	// The dogfood /uptime flake: a counter recorded once (or twice
+	// within the same tick) is never marked self-dynamic by the buffer,
+	// and its stale recorded body would read as drift. The spaced probe
+	// pair on the fork itself sees the movement.
+	shortConfirm(t)
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "100") }, "/uptime")
+	n := 0
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { n++; fmt.Fprintf(w, "%d", n) }))
+	defer fork.Close()
+
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 0 || res.Dynamic != 1 {
+		t.Errorf("res = %+v", res)
+	}
+	if res.Matched+res.Dynamic+res.Mismatched != res.Replayed {
+		t.Errorf("counts not disjoint: %+v", res)
+	}
+}
+
+func TestRunConfirmedStableBodyStaysMismatch(t *testing.T) {
+	// The confirm probes must not excuse real drift: a fork that answers
+	// the same wrong body twice is genuinely different from live.
+	shortConfirm(t)
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "old") }, "/page")
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "NEW") }))
+	defer fork.Close()
+
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 1 || res.Dynamic != 0 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestRunBufferProvenStaticDeniesConfirmRescue(t *testing.T) {
+	// Two identical recorded bodies over a second apart prove the path
+	// static on live; a fork answering it nondeterministically (e.g. a
+	// dropped sort) is a real regression the confirm probes must not
+	// excuse as dynamic.
+	shortConfirm(t)
+	t0 := time.Now()
+	entries := []Entry{
+		{Method: "GET", Path: "/api", Header: http.Header{}, At: t0.Add(-3 * time.Second), Status: 200, RespBody: []byte("stable")},
+		{Method: "GET", Path: "/api", Header: http.Header{}, At: t0, Status: 200, RespBody: []byte("stable")},
+	}
+	var n atomic.Int32
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "shuffle %d", n.Add(1)) }))
+	defer fork.Close()
+
+	res := Run(entries, 2, strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 2 || res.Dynamic != 0 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestRunStatusFlapIsNotDynamism(t *testing.T) {
+	// A fork that 500s intermittently must not have its body mismatch
+	// excused: only body movement at the recorded status is exculpatory.
+	shortConfirm(t)
+	b := NewBuffer(8)
+	record(t, b, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "old") }, "/page")
+	n := 0
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			fmt.Fprint(w, "NEW")
+			return
+		}
+		w.WriteHeader(500)
+	}))
+	defer fork.Close()
+
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 1 || res.Dynamic != 0 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestCaptureDropsHeadBodies(t *testing.T) {
+	// net/http never sends handler body writes to a HEAD client; keeping
+	// the teed bytes made every replayed HEAD a guaranteed mismatch
+	// against the fork's genuinely empty answer.
+	b := NewBuffer(8)
+	h := func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "page body") }
+	srv := captureServer(b, map[string]bool{"HEAD": true}, nil, h)
+	req, _ := http.NewRequest("HEAD", srv.URL+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	srv.Close()
+
+	if e := b.Snapshot(1)[0]; len(e.RespBody) != 0 {
+		t.Fatalf("HEAD entry kept a body the client never received: %q", e.RespBody)
+	}
+	fork := httptest.NewServer(http.HandlerFunc(h))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Matched != 1 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestRunNeverReprobesMutations(t *testing.T) {
+	// Replaying a recorded mutation once is the operator's explicit
+	// choice (replay.methods); issuing it twice more to check for
+	// dynamism is not ours to decide.
+	shortConfirm(t)
+	b := NewBuffer(8)
+	hits := 0
+	srv := captureServer(b, map[string]bool{"POST": true}, nil, func(w http.ResponseWriter, r *http.Request) { hits++; fmt.Fprintf(w, "%d", hits) })
+	resp, err := http.Post(srv.URL+"/incr", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	srv.Close()
+
+	forkHits := 0
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forkHits++; fmt.Fprintf(w, "%d", forkHits+100) }))
+	defer fork.Close()
+
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 1 {
+		t.Errorf("res = %+v", res)
+	}
+	if forkHits != 1 {
+		t.Errorf("mutation hit the fork %d times, want exactly 1", forkHits)
+	}
+}
+
+// gzipHandler serves body gzip-compressed, like standard compression
+// middleware would.
+func gzipHandler(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "text/html")
+		zw := gzip.NewWriter(w)
+		fmt.Fprint(zw, body)
+		zw.Close()
+	}
+}
+
+func TestCaptureRecordsGzipDecompressed(t *testing.T) {
+	// Apps with compression middleware gzip nearly everything; skipping
+	// those responses empties the buffer and the gate passes vacuously.
+	b := NewBuffer(8)
+	record(t, b, gzipHandler("<html>hello</html>"), "/page")
+	if b.Len() != 1 {
+		t.Fatalf("gzip response not captured, buffered = %d", b.Len())
+	}
+	if e := b.Snapshot(1)[0]; string(e.RespBody) != "<html>hello</html>" {
+		t.Fatalf("RespBody = %q, want decompressed html", e.RespBody)
+	}
+
+	// Identical gzip-serving fork: replay must decompress its answer
+	// too, and match.
+	fork := httptest.NewServer(gzipHandler("<html>hello</html>"))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Matched != 1 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestRunFlagsChangedGzipBody(t *testing.T) {
+	// Decompression must not hide a real change inside compressed
+	// responses.
+	shortConfirm(t)
+	b := NewBuffer(8)
+	record(t, b, gzipHandler("old content"), "/page")
+	fork := httptest.NewServer(gzipHandler("NEW content"))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), 5*time.Second)
+	if res.Mismatched != 1 {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestRunLocationComparedNormalized(t *testing.T) {
+	// A volatile redirect target (per-request state token) was a
+	// permanent mismatch whose report showed Want == Got - both sides
+	// normalize to the same placeholder. Compare what is displayed.
+	b := NewBuffer(8)
+	srv := captureServer(b, map[string]bool{"GET": true}, nil, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/login?state=1b4e28ba-2fa1-11d2-883f-0016d3cca427", http.StatusFound)
+	})
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := noFollow.Get(srv.URL + "/go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	srv.Close()
+	fork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/login?state=550e8400-e29b-41d4-a716-446655440000", http.StatusFound)
+	}))
+	defer fork.Close()
+	res := Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(fork.URL, "http://"), time.Second)
+	if res.Mismatched != 0 {
+		t.Errorf("volatile redirect target read as mismatch: %+v", res.Mismatches)
+	}
+
+	// A genuinely moved redirect still flags.
+	moved := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/signin", http.StatusFound)
+	}))
+	defer moved.Close()
+	res = Run(b.Snapshot(1), b.Len(), strings.TrimPrefix(moved.URL, "http://"), time.Second)
+	if res.Mismatched != 1 {
+		t.Errorf("moved redirect not flagged: %+v", res)
 	}
 }
 

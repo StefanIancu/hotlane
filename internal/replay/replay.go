@@ -12,6 +12,7 @@ package replay
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -41,6 +42,11 @@ type Entry struct {
 	Host   string
 	Header http.Header
 	Body   []byte
+
+	// At is when the exchange was recorded. Comparison uses it as
+	// evidence spacing: two identical bodies recorded over a second
+	// apart prove a path static in a way two same-tick samples cannot.
+	At time.Time
 
 	Status   int
 	RespBody []byte
@@ -143,7 +149,6 @@ type recorder struct {
 	body     bytes.Buffer
 	overflow bool
 	hijacked bool
-	encoded  bool // Content-Encoding set: bytes are compressed, useless to compare
 }
 
 func (r *recorder) Flush() {
@@ -163,10 +168,6 @@ func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (r *recorder) WriteHeader(code int) {
 	r.status = code
-	// A compressed body normalizes to nothing useful: the volatile
-	// patterns never match, so an identical response with one timestamp
-	// inside reads as a mismatch, and the diff prints binary garbage.
-	r.encoded = r.ResponseWriter.Header().Get("Content-Encoding") != ""
 	r.ResponseWriter.WriteHeader(code)
 }
 
@@ -197,8 +198,31 @@ func Capture(next http.Handler, b *Buffer, methods map[string]bool, exclude []st
 		}
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		if bodyOverflow || rec.overflow || rec.hijacked || rec.encoded {
+		// Compressed bytes are useless to compare directly - the volatile
+		// patterns never match and the diff prints binary garbage - but an
+		// app with standard gzip middleware compresses nearly EVERYTHING,
+		// and skipping those responses empties the buffer: the gate then
+		// passes vacuously on an app it never actually probed. gzip is
+		// stdlib, so those bodies are stored decompressed instead; rarer
+		// encodings (br, zstd) stay uncapturable.
+		enc := w.Header().Get("Content-Encoding")
+		if bodyOverflow || rec.overflow || rec.hijacked || (enc != "" && enc != "gzip") {
 			return
+		}
+		respBody := append([]byte(nil), rec.body.Bytes()...)
+		if enc == "gzip" {
+			plain, err := gunzip(respBody, bodyCap)
+			if err != nil {
+				return // truncated or corrupt stream: not a usable probe
+			}
+			respBody = plain
+		}
+		if r.Method == http.MethodHead {
+			// net/http discards handler body writes on HEAD - the
+			// recorder tees what the handler wrote, not what the client
+			// received. Keeping it would make every replayed HEAD a
+			// guaranteed body mismatch against the fork's (empty) answer.
+			respBody = nil
 		}
 		b.add(Entry{
 			Method:       r.Method,
@@ -206,8 +230,9 @@ func Capture(next http.Handler, b *Buffer, methods map[string]bool, exclude []st
 			Host:         r.Host,
 			Header:       r.Header.Clone(),
 			Body:         append([]byte(nil), reqBody.Bytes()...),
+			At:           time.Now(),
 			Status:       rec.status,
-			RespBody:     append([]byte(nil), rec.body.Bytes()...),
+			RespBody:     respBody,
 			RespType:     w.Header().Get("Content-Type"),
 			RespLocation: w.Header().Get("Location"),
 		})
@@ -309,8 +334,11 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 	// following it would compare whatever the redirect lands on instead
 	// - so a fork that changes where /go sends users would be judged on
 	// the destination page rather than the redirect itself.
+	// Per-request cap follows the run budget: hard-coding it lower
+	// would permanently fail any endpoint slower than the hard-code
+	// even when the operator raised budget: exactly to accommodate it.
 	client := &http.Client{
-		Timeout:       5 * time.Second,
+		Timeout:       budget,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
@@ -331,6 +359,43 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 		}(i, e)
 	}
 	wg.Wait()
+
+	// A body mismatch can be the buffer's fault rather than the fork's:
+	// dynamicPaths only marks a path self-dynamic when the buffer holds
+	// two samples with different bodies, so a path recorded once - or a
+	// seconds-grained counter recorded twice within the same tick -
+	// arrives here with a stale recorded body that reads as drift.
+	// Before letting such a mismatch stand, probe the path twice on the
+	// fork itself, spaced apart: content that moves under the fork's own
+	// feet cannot be evidence against it. Strictly a tiebreak for paths
+	// the buffer holds no real evidence on: a path live served the same
+	// body for across a second or more is proven static, and a fork
+	// answering it nondeterministically (a dropped sort, a half-warmed
+	// cache) is a regression the probe must not excuse. One probe pair
+	// per path, safe methods only - re-issuing a recorded mutation is
+	// not ours to decide.
+	static := staticProven(entries)
+	confirmed := map[string]bool{}
+	for i, v := range verdicts {
+		if !v.bodyMis || !safeMethod(entries[i].Method) {
+			continue
+		}
+		key := entries[i].Method + " " + entries[i].Path
+		if static[key] {
+			continue
+		}
+		dyn, seen := confirmed[key]
+		if !seen {
+			if ctx.Err() != nil {
+				continue
+			}
+			dyn = selfDynamicNow(ctx, client, backend, entries[i])
+			confirmed[key] = dyn
+		}
+		if dyn {
+			verdicts[i] = verdict{ok: true, dyn: true}
+		}
+	}
 
 	for _, v := range verdicts {
 		if v.mis == nil && !v.ok && !v.dyn {
@@ -360,17 +425,26 @@ func Run(entries []Entry, buffered int, backend string, budget time.Duration) Re
 // entry never ran (budget expiry) and is excluded from the tally.
 type verdict struct {
 	ok, dyn bool
+	bodyMis bool // the mismatch is body-level: status and contract headers agreed
 	mis     *Mismatch
 }
 
-func replayOne(ctx context.Context, client *http.Client, backend string, e Entry, dyn bool) (v verdict) {
+func buildReq(ctx context.Context, backend string, e Entry) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, e.Method, "http://"+backend+e.Path, bytes.NewReader(e.Body))
 	if err != nil {
-		return v
+		return nil, err
 	}
 	req.Header = e.Header.Clone()
 	if e.Host != "" {
 		req.Host = e.Host // replay the Host the client sent, not the fork's hostport
+	}
+	return req, nil
+}
+
+func replayOne(ctx context.Context, client *http.Client, backend string, e Entry, dyn bool) (v verdict) {
+	req, err := buildReq(ctx, backend, e)
+	if err != nil {
+		return v
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -381,7 +455,7 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 		return v
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, bodyCap+1))
+	body := readCapped(resp)
 
 	if resp.StatusCode != e.Status {
 		v.mis = &Mismatch{Method: e.Method, Path: e.Path, WantStatus: e.Status, GotStatus: resp.StatusCode}
@@ -395,7 +469,12 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 		}
 		return v
 	}
-	if got := resp.Header.Get("Location"); e.RespLocation != "" && got != e.RespLocation {
+	// Compare Location NORMALIZED, exactly as it is displayed. Raw
+	// comparison made a volatile redirect target (/login?state=<uuid>)
+	// a permanent mismatch whose report showed Want == Got - both sides
+	// normalized to the identical placeholder - an undiagnosable
+	// standing gate failure.
+	if got := resp.Header.Get("Location"); e.RespLocation != "" && respdiff.Normalize(got) != respdiff.Normalize(e.RespLocation) {
 		v.mis = &Mismatch{
 			Method: e.Method, Path: e.Path,
 			WantStatus: e.Status, GotStatus: resp.StatusCode,
@@ -409,6 +488,7 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 	}
 	want, got := respdiff.Normalize(string(e.RespBody)), respdiff.Normalize(string(body))
 	if want != got {
+		v.bodyMis = true
 		v.mis = &Mismatch{
 			Method: e.Method, Path: e.Path,
 			WantStatus: e.Status, GotStatus: resp.StatusCode,
@@ -418,6 +498,121 @@ func replayOne(ctx context.Context, client *http.Client, backend string, e Entry
 	}
 	v.ok = true
 	return v
+}
+
+// confirmDelay spaces the two probes of a suspect path. Just over a
+// second: the finest granularity time-driven content moves at in
+// practice is a seconds counter, and two requests inside the same tick
+// look static.
+var confirmDelay = 1100 * time.Millisecond
+
+func safeMethod(m string) bool {
+	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
+}
+
+// selfDynamicNow reports whether the fork's own answer to e moves
+// between two probes spaced confirmDelay apart. Only body movement at
+// the recorded status is exculpatory - a status flap between probes is
+// instability, not dynamism, and status is always compared even for
+// dynamic paths. Probe errors, wrong statuses, and a budget expiry
+// mid-wait report false: an unconfirmed mismatch stands.
+func selfDynamicNow(ctx context.Context, client *http.Client, backend string, e Entry) bool {
+	s1, b1, err := probe(ctx, client, backend, e)
+	if err != nil || s1 != e.Status {
+		return false
+	}
+	select {
+	case <-time.After(confirmDelay):
+	case <-ctx.Done():
+		return false
+	}
+	s2, b2, err := probe(ctx, client, backend, e)
+	if err != nil || s2 != e.Status {
+		return false
+	}
+	return b1 != b2
+}
+
+// probe answers one request as a status and normalized body.
+func probe(ctx context.Context, client *http.Client, backend string, e Entry) (int, string, error) {
+	req, err := buildReq(ctx, backend, e)
+	if err != nil {
+		return 0, "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, respdiff.Normalize(string(readCapped(resp))), nil
+}
+
+// readCapped reads a response body up to the cap, decompressing gzip -
+// recorded bodies are stored decompressed, so comparisons must see the
+// fork's the same way. An undecodable stream falls back to the raw
+// bytes and lets the mismatch show.
+func readCapped(resp *http.Response) []byte {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, bodyCap+1))
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		if plain, err := gunzip(body, bodyCap); err == nil {
+			return plain
+		}
+	}
+	return body
+}
+
+// gunzip decompresses at most max bytes; larger or corrupt streams are
+// not usable probes.
+func gunzip(b []byte, max int) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, int64(max)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > max {
+		return nil, fmt.Errorf("decompressed body exceeds %d bytes", max)
+	}
+	return out, nil
+}
+
+// staticProven finds probes the buffer positively attests are static:
+// at least two samples of the same request, identical normalized
+// bodies, recorded over a second apart. Content moving at any
+// realistic granularity would have differed across that span, so a
+// fork answering such a path differently earned its mismatch and the
+// confirm probes must not get a chance to excuse it.
+func staticProven(entries []Entry) map[string]bool {
+	type span struct {
+		first, last time.Time
+		n           int
+	}
+	seen := map[string]*span{}
+	for _, e := range entries {
+		key := e.Method + " " + e.Path
+		s, ok := seen[key]
+		if !ok {
+			seen[key] = &span{first: e.At, last: e.At, n: 1}
+			continue
+		}
+		s.n++
+		if e.At.Before(s.first) {
+			s.first = e.At
+		}
+		if e.At.After(s.last) {
+			s.last = e.At
+		}
+	}
+	out := map[string]bool{}
+	for key, s := range seen {
+		// Identical bodies is implied for the keys that reach the
+		// confirm pass: differing bodies already landed in dynamicPaths.
+		out[key] = s.n >= 2 && s.last.Sub(s.first) >= time.Second
+	}
+	return out
 }
 
 // dynamicPaths finds probes whose normalized live bodies differ across

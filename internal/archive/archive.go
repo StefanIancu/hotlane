@@ -348,6 +348,15 @@ func replayDrift(entries []replay.Entry, buffered int, coldAddr string, budget t
 		return ""
 	}
 	res := replay.Run(entries, buffered, coldAddr, budget)
+	// An incomplete run is not a clean sheet: a cold boot that hangs on
+	// every DB-touching path produces zero mismatches by never
+	// answering, and calling that CLEAN would bless a catatonic image
+	// as the trusted rebuild base. The gate path already treats
+	// incomplete as failure; the drift path must match it.
+	if res.Incomplete() {
+		return fmt.Sprintf("replay against the clean build did not complete (%d/%d replayed within the budget) - treating as drift",
+			res.Replayed, len(entries))
+	}
 	if res.Mismatched == 0 {
 		return ""
 	}
@@ -372,6 +381,10 @@ func replayDrift(entries []replay.Entry, buffered int, coldAddr string, budget t
 // twice: whatever still differs between two requests to the SAME server
 // is dynamic content, which cannot be evidence of drift either way - for
 // such paths only the status code is compared.
+// confirmDelay spaces the drift re-probe; just over a second so a
+// seconds-grained counter is guaranteed to have moved.
+var confirmDelay = 1100 * time.Millisecond
+
 func compareResponses(cfg *config.Config, coldAddr, liveAddr string) string {
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, h := range cfg.Verify {
@@ -393,6 +406,21 @@ func compareResponses(cfg *config.Config, coldAddr, liveAddr string) string {
 			continue
 		}
 		if cold.body != live.body {
+			// Two back-to-back requests miss content that moves with
+			// time coarser than the request gap: a seconds counter
+			// answers twice within the same tick and looks static.
+			// Before calling this drift, ask LIVE again after a beat -
+			// live is the trusted side, and only its own movement can
+			// prove the content time-dynamic. A cold boot that answers
+			// differently while live holds still is drift, however
+			// unstable the cold answers are. Re-probe errors and status
+			// changes leave the drift verdict standing.
+			time.Sleep(confirmDelay)
+			ls, lb, lerr := get(client, liveAddr, path)
+			if lerr == nil && ls == live.status && respdiff.Normalize(lb) != live.body {
+				log.Printf("archive: drift check: %s is dynamic (live's own answer moves between spaced requests); comparing status only", path)
+				continue
+			}
 			return fmt.Sprintf("behavior differs on %s: clean build serves %q, live serves %q",
 				path, respdiff.Truncate(cold.body, 120), respdiff.Truncate(live.body, 120))
 		}
