@@ -42,9 +42,14 @@ type pushResponse struct {
 	*pool.ForkResult
 	Verify   []verify.Result `json:"verify"`
 	VerifyMs int64           `json:"verify_ms"`
-	Promoted bool            `json:"promoted"`
-	Replay   *replay.Result  `json:"replay,omitempty"`
-	Logs     string          `json:"logs,omitempty"`
+	// QueueMs is how long this request waited for the per-app flip lock
+	// before any work began. Pushes serialize; with several agents
+	// contending, the wait dwarfs the ~2s of actual machinery - an agent
+	// that can see the queue can go do something else instead.
+	QueueMs  int64          `json:"queue_ms"`
+	Promoted bool           `json:"promoted"`
+	Replay   *replay.Result `json:"replay,omitempty"`
+	Logs     string         `json:"logs,omitempty"`
 }
 
 // version is stamped by goreleaser at release time (-X main.version=...).
@@ -805,6 +810,13 @@ func cmdPush(args []string) {
 			fmt.Printf("--- fork logs ---\n%s\n", res.Logs)
 		}
 		log.Fatalf("push REJECTED after %dms: fork destroyed, live version untouched", res.TotalMs)
+	}
+	if res.QueueMs >= 1000 {
+		// The wait says more than the work when agents contend: name it,
+		// so "pushes got slow" reads as queueing, not machinery.
+		fmt.Printf("PROMOTED v%d live in %dms (waited %.1fs in queue behind other deploys first)\n",
+			res.Version, res.TotalMs, float64(res.QueueMs)/1000)
+		return
 	}
 	fmt.Printf("PROMOTED v%d live in %dms\n", res.Version, res.TotalMs)
 }

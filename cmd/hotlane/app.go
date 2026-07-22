@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/StefanIancu/hotlane/internal/archive"
@@ -40,6 +41,25 @@ type appRuntime struct {
 	// Pushes are serialized per app: forks share the shadow tree and the
 	// version counter, and one verified promote at a time is the contract.
 	pushMu sync.Mutex
+	// queued counts flip operations holding or waiting on pushMu. Status
+	// reports it so an agent can size the contention BEFORE joining it:
+	// the swarm test measured ~2s pushes at 16s p50 wall time behind six
+	// contending agents.
+	queued atomic.Int64
+}
+
+// lockFlip takes the per-app flip lock, reporting how long this caller
+// waited; unlockFlip releases it and keeps the queue count honest.
+func (a *appRuntime) lockFlip() time.Duration {
+	a.queued.Add(1)
+	t0 := time.Now()
+	a.pushMu.Lock()
+	return time.Since(t0)
+}
+
+func (a *appRuntime) unlockFlip() {
+	a.pushMu.Unlock()
+	a.queued.Add(-1)
 }
 
 // newAppRuntime boots one app: warm pool, proxy target, held-fork reaper,
@@ -228,6 +248,10 @@ func (a *appRuntime) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"held":            a.pool.HeldList(),
 		"archive":         a.arch.Status(),
 		"replay":          a.replayStatus(),
+		// Flip operations (push/test/promote/rollback) holding or
+		// waiting on the per-app lock right now. An agent seeing a deep
+		// queue can do other work and push later instead of blocking.
+		"queue": a.queued.Load(),
 	})
 }
 
@@ -267,8 +291,8 @@ func (a *appRuntime) handleRollback(w http.ResponseWriter, r *http.Request) {
 	// verify window is silently undone moments later by that push's
 	// promote - the operator gets a success response and then keeps
 	// serving the exact version they were escaping.
-	a.pushMu.Lock()
-	defer a.pushMu.Unlock()
+	a.lockFlip()
+	defer a.unlockFlip()
 	var req struct {
 		Version int `json:"version"`
 	}
@@ -304,8 +328,8 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "diff exceeds the 10MB limit - split the change, or check for large files that should be in .gitignore", http.StatusRequestEntityTooLarge)
 		return
 	}
-	a.pushMu.Lock()
-	defer a.pushMu.Unlock()
+	queued := a.lockFlip()
+	defer a.unlockFlip()
 
 	res, err := a.pool.Fork(diff, a.forkBase(true))
 	if err != nil {
@@ -313,7 +337,7 @@ func (a *appRuntime) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	out := pushResponse{ForkResult: res}
+	out := pushResponse{ForkResult: res, QueueMs: queued.Milliseconds()}
 
 	vStart := time.Now()
 	out.Verify, out.Promoted = verify.Run(a.cfg, res.Container, res.Backend)
@@ -389,15 +413,15 @@ func (a *appRuntime) handleTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "diff exceeds the 10MB limit - split the change, or check for large files that should be in .gitignore", http.StatusRequestEntityTooLarge)
 		return
 	}
-	a.pushMu.Lock()
-	defer a.pushMu.Unlock()
+	queued := a.lockFlip()
+	defer a.unlockFlip()
 
 	res, err := a.pool.Fork(diff, a.forkBase(false))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	out := pushResponse{ForkResult: res}
+	out := pushResponse{ForkResult: res, QueueMs: queued.Milliseconds()}
 	vStart := time.Now()
 	var ok bool
 	out.Verify, ok = verify.Run(a.cfg, res.Container, res.Backend)
@@ -441,8 +465,8 @@ func (a *appRuntime) handlePromote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	a.pushMu.Lock()
-	defer a.pushMu.Unlock()
+	a.lockFlip()
+	defer a.unlockFlip()
 	srcDir, res, err := a.pool.PromoteHeld(req.Version, a.ready)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
