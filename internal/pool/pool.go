@@ -107,6 +107,10 @@ func (p *Pool) Ensure() error {
 	// putting unpromoted, untested code in front of users on a restart.
 	// The held marker survives the daemon, so reap them before adopting.
 	p.reapHeldOnStart()
+	// Crash-stranded images heal at startup too, not only at the next
+	// promote's prune - a box that crashed and then went quiet would
+	// otherwise keep its orphans forever.
+	p.sweepOrphanImages()
 	// Prefer the version this daemon last put live. "Newest running
 	// container" is only the live one after a PROMOTE; after a ROLLBACK
 	// the newest running container is the version being rolled away
@@ -127,6 +131,17 @@ func (p *Pool) Ensure() error {
 		// Newest running version: a daemon restart can land inside the
 		// previous version's stop grace, when both old and new are
 		// briefly running - the newest is the one promote made live.
+		// This path is a guess, though, and the guess can land on a
+		// container the dead daemon had JUST superseded - with its
+		// orphaned `docker stop` still pending inside dockerd, due to
+		// kill the container seconds after we adopt it. Restart the
+		// candidate first: the pending stop lands on the old instance,
+		// not the one about to serve. (The recorded-live path above is
+		// immune - stops are only ever aimed at containers the marker
+		// no longer names - so it keeps its zero-downtime adoption.)
+		if err := docker.Restart(running[0]); err != nil {
+			log.Printf("pool: restarting adoption candidate %s: %v", running[0], err)
+		}
 		return p.adopt(running[0])
 	}
 	return p.createBaseline()
@@ -512,6 +527,49 @@ func (p *Pool) prune() {
 		// Best effort: v1 has no snapshot image (baseline runs on cfg.Image).
 		docker.RemoveImage(p.imageRef(e.Version))
 	}
+	p.sweepOrphanImages()
+}
+
+// sweepOrphanImages removes version images whose container is gone.
+// Every other collector is container-driven, so an image stranded by a
+// crash between snapshot and container creation (Fork's cleanup defer
+// dies with the daemon) would otherwise survive forever - one full
+// filesystem snapshot per crash, invisible until the disk fills. A
+// 45-minute kill -9 soak stranded 22 of them. Inflight and held
+// versions are protected: their image legitimately precedes or outlives
+// its container's ring presence. Callers hold p.mu (or run before
+// serving starts).
+func (p *Pool) sweepOrphanImages() {
+	infos, err := docker.All(p.Cfg.App)
+	if err != nil {
+		return
+	}
+	haveContainer := map[int]bool{}
+	for _, in := range infos {
+		if v := versionFromName(in.Name); v > 0 {
+			haveContainer[v] = true
+		}
+	}
+	refs, err := docker.VersionImages(p.Cfg.App)
+	if err != nil {
+		return
+	}
+	prefix := fmt.Sprintf("hotlane-%s:v", p.Cfg.App)
+	for _, ref := range refs {
+		vs, ok := strings.CutPrefix(ref, prefix)
+		if !ok {
+			continue // :clean and other non-version tags
+		}
+		v, err := strconv.Atoi(vs)
+		if err != nil || v == 0 || haveContainer[v] || p.inflight[v] {
+			continue
+		}
+		if _, held := p.held[v]; held {
+			continue
+		}
+		log.Printf("pool: sweeping orphaned image %s (no container - stranded by a crash mid-fork)", ref)
+		docker.RemoveImage(ref)
+	}
 }
 
 // pruneOrder ranks ring entries by how recently they were live, most
@@ -581,7 +639,22 @@ func (p *Pool) Rollback(version int, ready func(container, backend string) error
 	// let it land so we restart cleanly instead of adopting a dying
 	// container. Blocks the pool for at most the stop grace period.
 	p.waitStopped(target.Container)
-	if !docker.IsRunning(target.Container) {
+	if docker.IsRunning(target.Container) {
+		// A running non-live target should not exist in steady state:
+		// superseded containers stop within their grace period, and an
+		// in-flight stop was just waited out above. It means a PREVIOUS
+		// daemon instance died during this container's stop grace - and
+		// the orphaned `docker stop` CLI it spawned may still be pending
+		// inside dockerd, a kill order due to land seconds after we put
+		// this container in front of users (a 45-minute kill -9 soak
+		// caught exactly that assassination). A forced restart satisfies
+		// the pending stop against the old instance and hands us a fresh
+		// one nothing is aiming at.
+		res.Restarted = true
+		if err := docker.Restart(target.Container); err != nil {
+			return nil, err
+		}
+	} else {
 		res.Restarted = true
 		if err := docker.Start(target.Container); err != nil {
 			return nil, err

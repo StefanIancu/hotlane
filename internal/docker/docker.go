@@ -253,6 +253,30 @@ func Build(dir, tag string) error {
 }
 
 // TagImage adds a tag to an existing image.
+// Restart stops a container immediately and starts it again. Used when
+// a container might have a stop order pending inside dockerd (issued by
+// a daemon instance that died): the restart satisfies the pending stop
+// against the old instance and yields a fresh one nothing is aiming at.
+func Restart(name string) error {
+	_, err := run("restart", "-t", "0", name)
+	return err
+}
+
+// VersionImages lists this app's image tags (hotlane-<app>:*).
+func VersionImages(app string) ([]string, error) {
+	out, err := run("images", "--format", "{{.Repository}}:{{.Tag}}", "hotlane-"+app)
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			refs = append(refs, line)
+		}
+	}
+	return refs, nil
+}
+
 // ContainerImageID returns the image ID a container was created from.
 func ContainerImageID(name string) (string, error) {
 	out, err := run("inspect", "-f", "{{.Image}}", name)
